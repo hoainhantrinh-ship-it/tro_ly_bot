@@ -28,19 +28,21 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Chạy server web trên Render kết hợp webhook chuẩn để tránh xung đột
-const http = require('http');
-const PORT = process.env.PORT || 3000;
-
-const server = http.createServer((req, res) => {
-  if (req.url === '/' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Bot is running smoothly!');
-  } else {
-    bot.handleUpdate(req, res);
-  }
+// Xóa webhook cũ trên Telegram trước khi khởi động bot bằng polling để không bị kẹt
+bot.telegram.deleteWebhook().then(() => {
+    bot.launch();
+    console.log("Trợ lý 'tt' đã khởi động thành công qua Polling!");
 });
 
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is running!');
+});
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Trợ lý 'tt' đang lắng nghe trên cổng ${PORT}`);
+  console.log(`Server is listening on port ${PORT}`);
 });
