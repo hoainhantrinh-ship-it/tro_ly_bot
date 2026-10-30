@@ -28,7 +28,7 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Chạy server web trên Render và cấu hình webhook hoặc bắt sự kiện chuẩn
+// Chạy server web trên Render kết hợp webhook chuẩn để tránh xung đột
 const http = require('http');
 const PORT = process.env.PORT || 3000;
 
