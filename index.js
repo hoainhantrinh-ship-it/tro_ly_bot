@@ -21,6 +21,7 @@ async function runChat(userMessage) {
     }
 }
 
+// Xử lý tin nhắn trực tiếp qua sự kiện telegraf
 bot.on('text', async (ctx) => {
     const userMessage = ctx.message.text;
     await ctx.sendChatAction('typing');
@@ -28,21 +29,32 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Xóa webhook cũ trên Telegram trước khi khởi động bot bằng polling để không bị kẹt
-bot.telegram.deleteWebhook().then(() => {
-    bot.launch();
-    console.log("Trợ lý 'tt' đã khởi động thành công qua Polling!");
-});
-
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
+// Tạo server HTTP nhận webhook trực tiếp từ Telegram
 const http = require('http');
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Bot is running!');
-});
 const PORT = process.env.PORT || 3000;
+
+const server = http.createServer((req, res) => {
+  if (req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const update = JSON.parse(body);
+        bot.handleUpdate(update);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok' }));
+      } catch (err) {
+        console.error("Lỗi xử lý webhook:", err);
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request');
+      }
+    });
+  } else {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Trợ lý tt đang hoạt động ổn định!');
+  }
+});
+
 server.listen(PORT, () => {
-  console.log(`Server is listening on port ${PORT}`);
+  console.log(`Server webhook đang chạy trên cổng ${PORT}`);
 });
