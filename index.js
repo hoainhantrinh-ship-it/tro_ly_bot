@@ -28,32 +28,22 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Tự động bắt đúng cổng mà Render cung cấp
-const http = require('http');
-const PORT = process.env.PORT || 3000;
-
-const server = http.createServer((req, res) => {
-  if (req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const update = JSON.parse(body);
-        bot.handleUpdate(update);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok' }));
-      } catch (err) {
-        console.error("Lỗi xử lý webhook:", err);
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Bad Request');
-      }
-    });
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Trợ lý tt đang hoạt động ổn định!');
-  }
+// Xóa webhook cũ trên Telegram để chuyển về polling mượt mà không bị xung đột
+bot.telegram.deleteWebhook({ drop_pending_updates: true }).then(() => {
+    bot.launch();
+    console.log("Trợ lý 'tt' đã khởi động thành công qua Polling!");
 });
 
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// Duy trì server HTTP để Render luôn giữ service ở trạng thái Live
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is running!');
+});
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server webhook đang chạy trên cổng ${PORT}`);
+  console.log(`Server is listening on port ${PORT}`);
 });
