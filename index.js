@@ -21,7 +21,6 @@ async function runChat(userMessage) {
     }
 }
 
-// Xử lý tin nhắn trực tiếp qua sự kiện telegraf
 bot.on('text', async (ctx) => {
     const userMessage = ctx.message.text;
     await ctx.sendChatAction('typing');
@@ -29,7 +28,7 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Tạo server HTTP nhận webhook trực tiếp từ Telegram
+// Tự động bắt đúng cổng mà Render cung cấp
 const http = require('http');
 const PORT = process.env.PORT || 3000;
 
