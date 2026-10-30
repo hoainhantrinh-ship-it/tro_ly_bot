@@ -28,32 +28,12 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Sử dụng Server HTTP kết hợp Webhook chuẩn xác cho Render
+// Sử dụng cơ chế webhook chuẩn của Telegraf tích hợp sẵn với http server
 const http = require('http');
 const PORT = process.env.PORT || 10000;
 
-const server = http.createServer((req, res) => {
-  if (req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const update = JSON.parse(body);
-        bot.handleUpdate(update);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok' }));
-      } catch (err) {
-        console.error("Lỗi xử lý webhook:", err);
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Bad Request');
-      }
-    });
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Trợ lý tt đang hoạt động ổn định!');
-  }
-});
+const server = http.createServer(bot.webhookCallback('/'));
 
 server.listen(PORT, () => {
-  console.log(`Server webhook đang chạy trên cổng ${PORT}`);
+  console.log(`Server webhook Telegraf đang chạy trên cổng ${PORT}`);
 });
