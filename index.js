@@ -28,7 +28,6 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Khởi động bot trực tiếp qua polling
 bot.launch();
 console.log("Trợ lý 'tt' đã khởi động thành công!");
 
