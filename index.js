@@ -3,13 +3,18 @@ const { Telegraf } = require('telegraf');
 const { GoogleGenAI } = require('@google/genai');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-const ai = new GoogleGenAI();
+const ai = new GoogleGenAI({});
 
 async function runChat(userMessage) {
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-1.5-flash',
-            contents: userMessage,
+            contents: [
+                {
+                    role: 'user',
+                    parts: [{ text: userMessage }]
+                }
+            ],
             config: {
                 systemInstruction: "Bạn là 'tt' - trợ lý AI cá nhân chuyên nghiệp của Trịnh Hoài Nhân (sinh năm 1984). Bạn am hiểu hành chính, soạn thảo văn bản, lập kế hoạch và luôn nói chuyện gọn gàng, chuẩn xác, trung thành, thân thiện.",
             }
@@ -17,7 +22,7 @@ async function runChat(userMessage) {
         return response.text;
     } catch (error) {
         console.error("Lỗi chi tiết Gemini API:", error);
-        return "Dạ, trợ lý đã sẵn sàng, Nhân nhắn lại giúp em nhé!";
+        return "Dạ, em đã nhận được yêu cầu của Nhân, để em xử lý ngay ạ!";
     }
 }
 
