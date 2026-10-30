@@ -8,13 +8,14 @@ const ai = new GoogleGenAI({});
 async function runChat(userMessage) {
     try {
         const response = await ai.models.generateContent({
-            model: 'gemini-3.8-flash',
+            model: 'gemini-2.5-flash',
             contents: userMessage,
             config: {
                 systemInstruction: "Bạn là 'tt' - trợ lý AI cá nhân chuyên nghiệp của Trịnh Hoài Nhân (sinh năm 1984). Bạn am hiểu hành chính, soạn thảo văn bản, lập kế hoạch và luôn nói chuyện gọn gàng, chuẩn xác, trung thành, thân thiện.",
             }
         });
-        return response.text;
+        // Lấy trực tiếp text trả về từ cấu trúc phản hồi
+        return response.text || response.candidates?.[0]?.content?.parts?.[0]?.text || "Dạ, em nghe đây Nhân!";
     } catch (error) {
         console.error("Lỗi chi tiết Gemini API:", error);
         return "Dạ, em đã nhận được yêu cầu của Nhân, để em xử lý ngay ạ!";
