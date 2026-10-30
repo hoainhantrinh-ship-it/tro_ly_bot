@@ -44,3 +44,13 @@ console.log("Trợ lý 'tt' đã khởi động thành công trên Telegram!");
 // Bật tắt an toàn
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// Tạo web server đơn giản để Render nhận diện cổng mạng
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is running!');
+});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Server is listening on port ${PORT}`);
+});
