@@ -28,16 +28,13 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Xóa webhook cũ trên Telegram để chuyển về polling mượt mà không bị xung đột
-bot.telegram.deleteWebhook({ drop_pending_updates: true }).then(() => {
-    bot.launch();
-    console.log("Trợ lý 'tt' đã khởi động thành công qua Polling!");
-});
+// Khởi động bot trực tiếp qua polling an toàn
+bot.launch();
+console.log("Trợ lý 'tt' đã khởi động thành công trên Telegram!");
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
-// Duy trì server HTTP để Render luôn giữ service ở trạng thái Live
 const http = require('http');
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
