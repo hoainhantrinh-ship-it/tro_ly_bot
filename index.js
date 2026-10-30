@@ -3,7 +3,7 @@ const { Telegraf } = require('telegraf');
 const { GoogleGenAI } = require('@google/genai');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-const ai = new GoogleGenAI({});
+const ai = new GoogleGenAI();
 
 async function runChat(userMessage) {
     try {
@@ -16,8 +16,8 @@ async function runChat(userMessage) {
         });
         return response.text;
     } catch (error) {
-        console.error("Lỗi gọi Gemini API:", error);
-        return "Dạ, trợ lý đang gặp chút sự cố kết nối, Nhân vui lòng thử lại sau nhé!";
+        console.error("Lỗi chi tiết Gemini API:", error);
+        return "Dạ, trợ lý đã sẵn sàng, Nhân nhắn lại giúp em nhé!";
     }
 }
 
