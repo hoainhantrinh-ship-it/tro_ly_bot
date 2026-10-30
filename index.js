@@ -4,7 +4,7 @@ const { GoogleGenAI } = require('@google/genai');
 
 // Lấy Token và API Key từ biến môi trường
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenAI({});
 
 // Khởi tạo phiên trò chuyện mang tính cách của "tt"
 async function runChat(userMessage) {
@@ -44,6 +44,7 @@ console.log("Trợ lý 'tt' đã khởi động thành công trên Telegram!");
 // Bật tắt an toàn
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
 // Tạo web server đơn giản để Render nhận diện cổng mạng
 const http = require('http');
 const server = http.createServer((req, res) => {
