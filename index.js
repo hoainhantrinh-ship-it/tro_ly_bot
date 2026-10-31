@@ -9,7 +9,8 @@ const { Document, Packer, Paragraph, TextRun, AlignmentType } = require('docx');
 // ===== CẤU HÌNH =====
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const MODELS = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash'];
+// Ưu tiên model Flash-Lite vì gói miễn phí cho nhiều lượt/ngày hơn (khoảng 500 so với 20)
+const MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash'];
 const ALLOWED_ID = Number(process.env.ALLOWED_USER_ID || 0);
 const PORT = process.env.PORT || 10000;
 const DOMAIN = process.env.RENDER_EXTERNAL_URL;
@@ -89,6 +90,10 @@ async function callGemini(contents) {
           attempt--;
           console.warn('Tắt Google Search:', m.slice(0, 120));
           continue;
+        }
+        if (/429|RESOURCE_EXHAUSTED/i.test(m)) {
+          console.warn(`Model ${model} hết hạn mức, đổi model.`);
+          break; // không thử lại cùng model để khỏi tốn thêm lượt
         }
         if (isModelGone(m)) {
           console.warn(`Model ${model} không dùng được, đổi model.`);
