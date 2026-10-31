@@ -69,7 +69,7 @@ function friendlyError(e) {
 
 // ===== GỌI AI (tự thử lại, tự đổi model, tự bật/tắt Google Search) =====
 async function callGemini(contents) {
-  let useSearch = true;
+  let useSearch = false; // đổi thành true để bật Google Search (cần tài khoản có thanh toán)
   let lastErr;
   for (const model of MODELS) {
     for (let attempt = 1; attempt <= 2; attempt++) {
