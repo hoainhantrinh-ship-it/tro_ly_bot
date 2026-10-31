@@ -1,5 +1,6 @@
 require('dotenv').config();
 const http = require('http');
+const https = require('https');
 const { Telegraf } = require('telegraf');
 const { GoogleGenAI } = require('@google/genai');
 const mammoth = require('mammoth');
@@ -22,7 +23,11 @@ if (!TOKEN || !GEMINI_KEY) {
   process.exit(1);
 }
 
-const bot = new Telegraf(TOKEN, { handlerTimeout: 180000 });
+const bot = new Telegraf(TOKEN, {
+  handlerTimeout: 180000,
+  // Không giữ kết nối cũ, tránh lỗi "socket hang up" khi gửi file về Telegram
+  telegram: { agent: new https.Agent({ keepAlive: false }) },
+});
 const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
 
 function buildSystem() {
@@ -196,12 +201,23 @@ bot.command('docx', async (ctx) => {
   const text = lastReply.get(ctx.chat.id);
   if (!text) return ctx.reply('Chưa có nội dung để xuất. NHÂN nhờ em soạn trước nhé.');
   try {
-    await ctx.sendChatAction('upload_document');
+    await ctx.sendChatAction('upload_document').catch(() => {});
     const buffer = await toDocx(text);
-    await ctx.replyWithDocument({ source: buffer, filename: 'van_ban_tt.docx' });
+    let lastErr;
+    for (let i = 1; i <= 3; i++) {
+      try {
+        await ctx.replyWithDocument({ source: buffer, filename: 'van_ban_tt.docx' });
+        return;
+      } catch (e) {
+        lastErr = e;
+        console.warn(`Gửi file Word lỗi (lần ${i}):`, errText(e).slice(0, 120));
+        await sleep(i * 1500);
+      }
+    }
+    throw lastErr;
   } catch (e) {
     console.error('Lỗi xuất docx:', e);
-    await ctx.reply('Lỗi xuất file Word: ' + errText(e).slice(0, 200));
+    await ctx.reply('Chưa gửi được file Word do đường truyền, NHÂN gõ /docx lại sau ít giây nhé.');
   }
 });
 
