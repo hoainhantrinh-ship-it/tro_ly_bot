@@ -161,6 +161,26 @@ async function downloadFile(ctx, fileId) {
   return Buffer.from(await r.arrayBuffer());
 }
 
+// Gửi file trực tiếp qua API Telegram bằng fetch có sẵn của Node (ổn định hơn khi mạng yếu)
+async function sendDocumentDirect(chatId, buffer, filename) {
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  form.append('document', new Blob([buffer]), filename);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60000);
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, {
+      method: 'POST',
+      body: form,
+      signal: controller.signal,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error('Telegram từ chối: ' + (j.description || r.status));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const clip = (s) => (s.length > MAX_TEXT ? s.slice(0, MAX_TEXT) + '\n[...đã cắt bớt do quá dài]' : s);
 
 // ===== XUẤT WORD =====
@@ -218,13 +238,20 @@ bot.command('docx', async (ctx) => {
     let lastErr;
     for (let i = 1; i <= 3; i++) {
       try {
-        await ctx.replyWithDocument({ source: buffer, filename: 'van_ban_tt.docx' });
+        await sendDocumentDirect(ctx.chat.id, buffer, 'van_ban_tt.docx');
         return;
       } catch (e) {
         lastErr = e;
         console.warn(`Gửi file Word lỗi (lần ${i}):`, errText(e).slice(0, 120));
         await sleep(i * 1500);
       }
+    }
+    // Cách dự phòng: gửi bằng thư viện Telegraf
+    try {
+      await ctx.replyWithDocument({ source: buffer, filename: 'van_ban_tt.docx' });
+      return;
+    } catch (e) {
+      lastErr = e;
     }
     throw lastErr;
   } catch (e) {
@@ -359,4 +386,7 @@ if (DOMAIN) {
   setInterval(() => fetch(DOMAIN).catch(() => {}), 10 * 60 * 1000);
 }
 
-process.once('SIGTERM', () => process.exit(0));
+process.once('SIGTERM', () => {
+  console.log('Nhận tín hiệu tắt, chờ 10 giây để hoàn tất việc đang làm.');
+  setTimeout(() => process.exit(0), 10000);
+});
