@@ -28,20 +28,12 @@ bot.on('text', async (ctx) => {
     await ctx.reply(replyText);
 });
 
-// Khởi động qua Polling
-bot.launch();
-console.log("Trợ lý 'tt' đã khởi động polling thành công!");
-
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-// Duy trì cổng HTTP cho Render không bị timeout
+// Khởi tạo HTTP server đón webhook từ Render
 const http = require('http');
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Bot is running!');
-});
 const PORT = process.env.PORT || 10000;
+
+const server = http.createServer(bot.webhookCallback('/'));
+
 server.listen(PORT, () => {
-  console.log(`Server HTTP đang chạy trên cổng ${PORT}`);
+  console.log(`Server webhook đang chạy trên cổng ${PORT}`);
 });
