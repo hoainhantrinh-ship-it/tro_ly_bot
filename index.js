@@ -43,11 +43,13 @@ Quy tắc:
 - Với hồ sơ, số liệu, tài liệu NHÂN cung cấp: bám sát 100%, không tự thêm bớt số liệu, không suy diễn thiếu căn cứ. Thiếu thông tin thì hỏi lại.
 - Soạn văn bản hành chính theo thể thức Nghị định 30/2020/NĐ-CP, bố cục rõ ràng.
 - Huy hiệu Đảng: các mốc 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95 năm tuổi Đảng; các đợt trao tặng 03/02, 30/04, 02/09, 07/11 hằng năm. Khi tính toán phải đối chiếu đúng mốc.
-- Không dùng ký hiệu markdown (như ** hoặc #). Viết văn bản thuần, liệt kê bằng dấu gạch đầu dòng "-".`;
+- Không dùng ký hiệu markdown (như ** hoặc #). Viết văn bản thuần, liệt kê bằng dấu gạch đầu dòng "-".
+- Khi soạn một văn bản hoàn chỉnh (công văn, báo cáo, quyết định, tờ trình, thông báo, kế hoạch, biên bản...): lời dẫn hoặc ghi chú (nếu có) viết ngắn gọn NGOÀI văn bản; toàn bộ nội dung văn bản đặt giữa hai dòng đánh dấu [[VAN_BAN]] và [[HET_VAN_BAN]] (mỗi dấu nằm trên một dòng riêng). Bên trong hai dấu này chỉ có nội dung văn bản, không có lời dẫn, ghi chú hay câu hỏi. Khi NHÂN yêu cầu chỉnh sửa, luôn gửi lại toàn văn đã chỉnh trong hai dấu này. Câu trả lời thông thường thì không dùng dấu này.`;
 }
 
 const history = new Map(); // chatId -> [{role, parts}]
 const lastReply = new Map(); // chatId -> câu trả lời gần nhất
+const lastDoc = new Map(); // chatId -> văn bản soạn gần nhất (chỉ phần nội dung văn bản)
 
 // ===== CHỈ CHO PHÉP NHÂN DÙNG =====
 bot.use((ctx, next) => {
@@ -123,8 +125,16 @@ async function ask(chatId, parts, savedText) {
   h.push({ role: 'user', parts: [{ text: savedText }] });
   h.push({ role: 'model', parts: [{ text }] });
   history.set(chatId, h.slice(-20));
-  lastReply.set(chatId, text);
-  return text;
+
+  // Tách riêng phần văn bản (giữa hai dấu) để /docx chỉ xuất nội dung văn bản
+  let shown = text;
+  const m = text.match(/\[\[VAN_BAN\]\]([\s\S]*?)(?:\[\[HET_VAN_BAN\]\]|$)/);
+  if (m && m[1].trim()) {
+    lastDoc.set(chatId, m[1].trim());
+    shown = text.replace(/\[\[(?:HET_)?VAN_BAN\]\]/g, '').replace(/\n{3,}/g, '\n\n').trim();
+  }
+  lastReply.set(chatId, shown);
+  return shown;
 }
 
 async function sendLong(ctx, text) {
@@ -186,7 +196,7 @@ bot.start((ctx) =>
       '- Nhắn trực tiếp để hỏi, nhờ soạn thảo, lập kế hoạch, tra cứu thông tin mới.\n' +
       '- Gửi file PDF, DOCX, XLSX, TXT, CSV hoặc ảnh chụp văn bản, ghi yêu cầu ở phần chú thích.\n' +
       '- Gửi tin nhắn thoại, em nghe và xử lý.\n' +
-      '/docx : xuất câu trả lời gần nhất thành file Word\n' +
+      '/docx : xuất văn bản vừa soạn thành file Word\n' +
       '/reset : xóa ngữ cảnh, bắt đầu việc mới'
   )
 );
@@ -194,11 +204,13 @@ bot.start((ctx) =>
 bot.command('reset', (ctx) => {
   history.delete(ctx.chat.id);
   lastReply.delete(ctx.chat.id);
+  lastDoc.delete(ctx.chat.id);
   return ctx.reply('Đã xóa ngữ cảnh hội thoại.');
 });
 
 bot.command('docx', async (ctx) => {
-  const text = lastReply.get(ctx.chat.id);
+  // Ưu tiên văn bản soạn gần nhất (không kèm lời dẫn); nếu chưa có thì lấy câu trả lời gần nhất
+  const text = lastDoc.get(ctx.chat.id) || lastReply.get(ctx.chat.id);
   if (!text) return ctx.reply('Chưa có nội dung để xuất. NHÂN nhờ em soạn trước nhé.');
   try {
     await ctx.sendChatAction('upload_document').catch(() => {});
@@ -327,7 +339,7 @@ http
     console.log('Server chạy cổng', PORT);
     try {
       await bot.telegram.setMyCommands([
-        { command: 'docx', description: 'Xuất câu trả lời gần nhất ra file Word' },
+        { command: 'docx', description: 'Xuất văn bản vừa soạn ra file Word' },
         { command: 'reset', description: 'Xóa ngữ cảnh, bắt đầu việc mới' },
         { command: 'start', description: 'Xem hướng dẫn' },
       ]);
