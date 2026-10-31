@@ -1,6 +1,6 @@
 {
   "name": "tro_ly_bot",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Tro ly AI hanh chinh qua Telegram",
   "main": "index.js",
   "scripts": {
@@ -16,6 +16,7 @@
     "docx": "^9.0.0",
     "dotenv": "^18.0.9",
     "mammoth": "^1.8.0",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "xlsx": "^0.18.5"
   }
 }
