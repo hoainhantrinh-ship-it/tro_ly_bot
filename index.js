@@ -5,7 +5,18 @@ const { Telegraf } = require('telegraf');
 const { GoogleGenAI } = require('@google/genai');
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
-const { Document, Packer, Paragraph, TextRun, AlignmentType } = require('docx');
+const {
+  Document,
+  Packer,
+  Paragraph,
+  TextRun,
+  AlignmentType,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  BorderStyle,
+} = require('docx');
 
 // ===== CẤU HÌNH =====
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -39,6 +50,7 @@ function buildSystem() {
   return `Bạn là "tt" - trợ lý ảo cá nhân của NHÂN (Trịnh Hoài Nhân), chuyên về quản trị kinh doanh, hồ sơ, công văn hành chính, báo cáo, lập kế hoạch và lên ý tưởng. Bây giờ là ${now} (giờ Việt Nam).
 Quy tắc:
 - Luôn gọi người dùng là NHÂN (không dùng "anh" hay "chị"), xưng "em". Trả lời gọn, trực diện, không mở đầu sáo rỗng.
+- Mặc định (khi NHÂN chỉ hỏi, nhờ tóm tắt hoặc trao đổi thông thường): trả lời và tóm tắt bình thường, ngắn gọn, không dàn trang thể thức văn bản. Chỉ khi NHÂN yêu cầu rõ "trình bày theo thể thức văn bản" (hoặc dùng lệnh /vanban) thì hệ thống mới tạo file Word đúng thể thức, em không cần tự dàn trang trong tin nhắn.
 - Câu hỏi kiến thức chung, tư vấn: trả lời đầy đủ. Bạn KHÔNG tra cứu được internet, nên với thời tiết, tin tức, giá cả, quy định mới nhất, hãy nói rõ em chưa tra cứu được thông tin thời gian thực và khuyên NHÂN kiểm tra nguồn chính thức, không tự bịa số liệu.
 - Với hồ sơ, số liệu, tài liệu NHÂN cung cấp: bám sát 100%, không tự thêm bớt số liệu, không suy diễn thiếu căn cứ. Thiếu thông tin thì hỏi lại.
 - Soạn văn bản hành chính theo thể thức Nghị định 30/2020/NĐ-CP, bố cục rõ ràng.
@@ -75,7 +87,8 @@ function friendlyError(e) {
 }
 
 // ===== GỌI AI (tự thử lại, tự đổi model, tự bật/tắt Google Search) =====
-async function callGemini(contents) {
+// opts.system: thay lời chỉ dẫn hệ thống; opts.json: bắt AI trả về JSON
+async function callGemini(contents, opts = {}) {
   let useSearch = false; // đổi thành true để bật Google Search (cần tài khoản có thanh toán)
   let lastErr;
   for (const model of MODELS) {
@@ -85,8 +98,9 @@ async function callGemini(contents) {
           model,
           contents,
           config: {
-            systemInstruction: buildSystem(),
-            ...(useSearch ? { tools: [{ googleSearch: {} }] } : {}),
+            systemInstruction: opts.system || buildSystem(),
+            ...(opts.json ? { responseMimeType: 'application/json' } : {}),
+            ...(useSearch && !opts.json ? { tools: [{ googleSearch: {} }] } : {}),
           },
         });
       } catch (e) {
@@ -126,7 +140,7 @@ async function ask(chatId, parts, savedText) {
   h.push({ role: 'model', parts: [{ text }] });
   history.set(chatId, h.slice(-20));
 
-  // Tách riêng phần văn bản (giữa hai dấu) để /docx chỉ xuất nội dung văn bản
+  // Tách riêng phần văn bản (giữa hai dấu) để xuất Word chỉ lấy nội dung văn bản
   let shown = text;
   const m = text.match(/\[\[VAN_BAN\]\]([\s\S]*?)(?:\[\[HET_VAN_BAN\]\]|$)/);
   if (m && m[1].trim()) {
@@ -183,40 +197,243 @@ async function sendDocumentDirect(chatId, buffer, filename) {
 
 const clip = (s) => (s.length > MAX_TEXT ? s.slice(0, MAX_TEXT) + '\n[...đã cắt bớt do quá dài]' : s);
 
-// ===== XUẤT WORD =====
-async function toDocx(text) {
-  const paragraphs = text.split('\n').map(
-    (line) =>
+// ===== XUẤT WORD THEO THỂ THỨC (Nghị định 30/2020/NĐ-CP) =====
+const FONT = 'Times New Roman';
+const NOB = { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
+const NOBS = { top: NOB, bottom: NOB, left: NOB, right: NOB };
+const run = (t, o = {}) => new TextRun({ text: t, font: FONT, size: 28, ...o });
+const para = (children, o = {}) =>
+  new Paragraph({ alignment: AlignmentType.CENTER, spacing: { before: 0, after: 0 }, ...o, children });
+const cell = (w, children) =>
+  new TableCell({
+    width: { size: w, type: WidthType.DXA },
+    borders: NOBS,
+    margins: { top: 0, bottom: 0, left: 0, right: 0 },
+    children,
+  });
+const hiddenTable = (widths, rows) =>
+  new Table({
+    width: { size: widths[0] + widths[1], type: WidthType.DXA },
+    columnWidths: widths,
+    borders: { ...NOBS, insideHorizontal: NOB, insideVertical: NOB },
+    rows: rows.map((r) => new TableRow({ cantSplit: true, children: [cell(widths[0], r[0]), cell(widths[1], r[1])] })),
+  });
+const underline = (indent) =>
+  new Paragraph({
+    alignment: AlignmentType.CENTER,
+    spacing: { before: 0, after: 0 },
+    indent: { left: indent, right: indent },
+    border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: '000000', space: 1 } },
+    children: [run('', { size: 4 })],
+  });
+
+function buildFormalDoc(d) {
+  const loai = String(d.loai || '').trim().toUpperCase();
+  const congVan = !loai;
+  const kyHieu = String(d.ky_hieu || '').trim();
+  const soText = kyHieu ? `Số: ....../${kyHieu}-......` : 'Số: ....../......';
+  const trichYeu = String(d.trich_yeu || '').trim();
+
+  // --- Phần đầu: bảng 2 cột ẩn viền ---
+  const left1 = [para([run('')]), para([run('')]), para([run('')])]; // góc trái để trống cho NHÂN điền tên đơn vị
+  const left2 = [para([run(soText, { size: 26 })], { spacing: { before: 120, after: 0 } })];
+  if (congVan && trichYeu) {
+    const cv = /^v\/v/i.test(trichYeu) ? trichYeu : 'V/v ' + trichYeu.replace(/^về việc\s*/i, '');
+    left2.push(para([run(cv, { size: 24 })], { spacing: { before: 60, after: 0 } }));
+  }
+  const right1 = [
+    para([run('CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM', { bold: true, size: 24 })]),
+    para([run('Độc lập - Tự do - Hạnh phúc', { bold: true, size: 26 })]),
+    underline(850),
+  ];
+  const ngay = String(d.dia_danh_ngay || '').trim() || '[Địa danh], ngày ... tháng ... năm 20...';
+  const right2 = [para([run(ngay, { italics: true, size: 28 })], { spacing: { before: 120, after: 0 } })];
+
+  const children = [hiddenTable([3600, 5187], [[left1, right1], [left2, right2]])];
+
+  // --- Tên loại, trích yếu ---
+  if (!congVan) {
+    children.push(para([run(loai, { bold: true })], { spacing: { before: 360, after: 0 } }));
+    if (trichYeu) {
+      children.push(para([run(trichYeu, { bold: true })]));
+      children.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 0, after: 240 },
+          indent: { left: 2700, right: 2700 },
+          border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: '000000', space: 1 } },
+          children: [run('', { size: 4 })],
+        })
+      );
+    } else {
+      children.push(para([run('')], { spacing: { after: 240 } }));
+    }
+  } else {
+    children.push(para([run('')], { spacing: { after: 240 } }));
+  }
+
+  // --- Kính gửi ---
+  const kg = [].concat(d.kinh_gui || []).map(String).filter(Boolean);
+  if (kg.length === 1) {
+    children.push(para([run('Kính gửi: ' + kg[0])], { spacing: { after: 240 } }));
+  } else if (kg.length > 1) {
+    children.push(para([run('Kính gửi:')]));
+    kg.forEach((x, i) =>
+      children.push(para([run('- ' + x.replace(/^-\s*/, ''))], { spacing: { after: i === kg.length - 1 ? 240 : 0 } }))
+    );
+  }
+
+  // --- Nội dung ---
+  const body = [].concat(d.noi_dung || []).map(String);
+  body.forEach((line) => {
+    const t = line.trim();
+    if (!t) return;
+    const roman = /^[IVX]+\.\s/.test(t);
+    const sub = /^\d+\.\s/.test(t) && t.length < 90 && !/[.;,:]$/.test(t);
+    children.push(
       new Paragraph({
         alignment: AlignmentType.JUSTIFIED,
-        spacing: { after: 120, line: 360 },
-        children: [new TextRun({ text: line, font: 'Times New Roman', size: 28 })],
+        spacing: { before: roman ? 120 : 0, after: 60, line: 360 },
+        indent: roman ? undefined : { firstLine: 720 },
+        children: [run(t, { bold: roman || sub })],
       })
+    );
+  });
+
+  // --- Nơi nhận, chức vụ, chữ ký ---
+  const noiNhan = [].concat(d.noi_nhan || []).map(String).filter(Boolean);
+  const chucVu = String(d.chuc_vu_ky || '').trim() || '[CHỨC VỤ NGƯỜI KÝ]';
+  const nguoiKy = String(d.nguoi_ky || '').trim() || '[Họ và tên]';
+  const nn = [para([run('Nơi nhận:', { bold: true, italics: true, size: 24 })], { alignment: AlignmentType.LEFT })];
+  noiNhan.forEach((x) =>
+    nn.push(para([run(x.startsWith('-') ? x : '- ' + x, { size: 22 })], { alignment: AlignmentType.LEFT }))
   );
+  const ky = [
+    para([run(chucVu.toUpperCase(), { bold: true })]),
+    para([run('(Ký, ghi rõ họ tên, đóng dấu)', { italics: true, size: 24 })]),
+    para([run('')]),
+    para([run('')]),
+    para([run('')]),
+    para([run(nguoiKy, { bold: true })]),
+  ];
+  children.push(para([run('')], { spacing: { before: 240, after: 0 } }));
+  children.push(hiddenTable([4300, 4487], [[nn, ky]]));
+
   const doc = new Document({
+    styles: { default: { document: { run: { font: FONT, size: 28 } } } },
     sections: [
       {
         properties: {
           page: {
             size: { width: 11906, height: 16838 },
-            margin: { top: 1134, bottom: 1134, left: 1701, right: 850 },
+            margin: { top: 1134, bottom: 1134, left: 1985, right: 1134 },
           },
         },
-        children: paragraphs,
+        children,
       },
     ],
   });
   return Packer.toBuffer(doc);
 }
 
+const FORMAL_PROMPT = `Chuyển yêu cầu/nội dung dưới đây thành văn bản hành chính theo thể thức Nghị định 30/2020/NĐ-CP. CHỈ trả về JSON hợp lệ, đúng cấu trúc:
+{
+  "loai": "BÁO CÁO | THÔNG BÁO | KẾ HOẠCH | TỜ TRÌNH | QUYẾT ĐỊNH | BIÊN BẢN... (để chuỗi rỗng nếu là CÔNG VĂN)",
+  "ky_hieu": "BC | TB | KH | TTr | QĐ | BB... (để rỗng nếu là công văn)",
+  "dia_danh_ngay": "chỉ điền nếu NHÂN nêu rõ, ví dụ: Đồng Nai, ngày 05 tháng 11 năm 2026; nếu không thì để rỗng",
+  "trich_yeu": "Về việc ... (báo cáo, tờ trình, kế hoạch...) hoặc V/v ... (công văn)",
+  "kinh_gui": "tên nơi nhận, để rỗng nếu không cần (có thể là mảng nếu nhiều nơi nhận)",
+  "noi_dung": ["từng đoạn văn, mỗi phần tử một đoạn; tiêu đề mục lớn viết dạng 'I. TÊN MỤC'"],
+  "noi_nhan": ["- Như trên;", "- Lưu: VT."],
+  "chuc_vu_ky": "để rỗng nếu NHÂN không nêu",
+  "nguoi_ky": "để rỗng nếu NHÂN không nêu"
+}
+Quy tắc:
+- Bám sát 100% số liệu, dữ liệu NHÂN cung cấp; không tự thêm bớt, không bịa. Chỗ thiếu thông tin ghi "......".
+- Không dùng ký hiệu markdown (như ** hoặc #).
+- Nếu yêu cầu có nội dung riêng thì dùng nội dung đó; nếu không có thì dùng "VĂN BẢN GẦN NHẤT" bên dưới.
+- Nếu hoàn toàn không có nội dung để trình bày, chỉ trả về {"thieu":"một câu hỏi ngắn gọn gửi NHÂN"}.`;
+
+async function structureDoc(request, prev) {
+  const prompt =
+    `${FORMAL_PROMPT}\n\nYÊU CẦU/NỘI DUNG CỦA NHÂN:\n${clip(request || '(không có)')}\n\nVĂN BẢN GẦN NHẤT:\n${clip(prev || '(không có)')}`;
+  const res = await callGemini([{ role: 'user', parts: [{ text: prompt }] }], {
+    system: 'Bạn là chuyên viên văn thư, soạn văn bản hành chính Việt Nam chuẩn thể thức. Chỉ trả về JSON.',
+    json: true,
+  });
+  const raw = (res.text || '').replace(/```json|```/g, '').trim();
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (m) return JSON.parse(m[0]);
+    throw new Error('AI trả về sai định dạng');
+  }
+}
+
+async function sendDocWithRetry(ctx, buffer, filename) {
+  let lastErr;
+  for (let i = 1; i <= 3; i++) {
+    try {
+      await sendDocumentDirect(ctx.chat.id, buffer, filename);
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`Gửi file Word lỗi (lần ${i}):`, errText(e).slice(0, 120));
+      await sleep(i * 1500);
+    }
+  }
+  try {
+    await ctx.replyWithDocument({ source: buffer, filename });
+    return;
+  } catch (e) {
+    lastErr = e;
+  }
+  throw lastErr;
+}
+
+async function makeFormalDoc(ctx, request) {
+  const id = ctx.chat.id;
+  const prev = lastDoc.get(id) || lastReply.get(id) || '';
+  if (!String(request).trim() && !prev) {
+    return ctx.reply('Chưa có nội dung để trình bày. NHÂN gửi nội dung hoặc nhờ em soạn trước nhé.');
+  }
+  let d;
+  try {
+    d = await withTyping(ctx, 'upload_document', () => structureDoc(request, prev));
+  } catch (e) {
+    console.error('Lỗi dựng văn bản:', e);
+    return ctx.reply(friendlyError(e));
+  }
+  if (d.thieu) return ctx.reply(String(d.thieu));
+  try {
+    const buffer = await buildFormalDoc(d);
+    await ctx.sendChatAction('upload_document').catch(() => {});
+    await sendDocWithRetry(ctx, buffer, 'van_ban_tt.docx');
+    const plain = [].concat(d.noi_dung || []).join('\n');
+    if (plain) lastDoc.set(id, plain);
+    const h = history.get(id) || [];
+    h.push({ role: 'user', parts: [{ text: request || '[Yêu cầu trình bày thể thức văn bản]' }] });
+    h.push({ role: 'model', parts: [{ text: `[Đã gửi file Word thể thức: ${d.loai || 'CÔNG VĂN'} ${d.trich_yeu || ''}]\n${plain}` }] });
+    history.set(id, h.slice(-20));
+    await ctx.reply('Em đã gửi file Word theo thể thức. Góc trái trên để trống cho NHÂN điền tên đơn vị.');
+  } catch (e) {
+    console.error('Lỗi xuất docx:', e);
+    await ctx.reply('Chưa gửi được file Word do đường truyền, NHÂN nhắn lại lệnh sau ít giây nhé.');
+  }
+}
+
 // ===== LỆNH =====
+// Câu nói tự nhiên kích hoạt chế độ thể thức, ví dụ: "trình bày theo thể thức văn bản", "xuất file word"
+const FORMAL_RE = /(trình bày|soạn|xuất|tạo|làm|lập|chuyển)[^\n]{0,40}(thể thức|file word|file docx)/i;
+
 bot.start((ctx) =>
   ctx.reply(
     'Dạ, em là tt, trợ lý của NHÂN.\n\n' +
-      '- Nhắn trực tiếp để hỏi, nhờ soạn thảo, lập kế hoạch, tra cứu thông tin mới.\n' +
+      '- Nhắn trực tiếp để hỏi, nhờ tóm tắt, soạn thảo, lập kế hoạch.\n' +
       '- Gửi file PDF, DOCX, XLSX, TXT, CSV hoặc ảnh chụp văn bản, ghi yêu cầu ở phần chú thích.\n' +
-      '- Gửi tin nhắn thoại, em nghe và xử lý.\n' +
-      '/docx : xuất văn bản vừa soạn thành file Word\n' +
+      '- Gửi tin nhắn thoại, em nghe và xử lý.\n\n' +
+      'Muốn có file Word đúng thể thức văn bản: nhắn "trình bày theo thể thức văn bản" (kèm nội dung hoặc yêu cầu) hoặc gõ /vanban.\n' +
       '/reset : xóa ngữ cảnh, bắt đầu việc mới'
   )
 );
@@ -228,42 +445,17 @@ bot.command('reset', (ctx) => {
   return ctx.reply('Đã xóa ngữ cảnh hội thoại.');
 });
 
-bot.command('docx', async (ctx) => {
-  // Ưu tiên văn bản soạn gần nhất (không kèm lời dẫn); nếu chưa có thì lấy câu trả lời gần nhất
-  const text = lastDoc.get(ctx.chat.id) || lastReply.get(ctx.chat.id);
-  if (!text) return ctx.reply('Chưa có nội dung để xuất. NHÂN nhờ em soạn trước nhé.');
-  try {
-    await ctx.sendChatAction('upload_document').catch(() => {});
-    const buffer = await toDocx(text);
-    let lastErr;
-    for (let i = 1; i <= 3; i++) {
-      try {
-        await sendDocumentDirect(ctx.chat.id, buffer, 'van_ban_tt.docx');
-        return;
-      } catch (e) {
-        lastErr = e;
-        console.warn(`Gửi file Word lỗi (lần ${i}):`, errText(e).slice(0, 120));
-        await sleep(i * 1500);
-      }
-    }
-    // Cách dự phòng: gửi bằng thư viện Telegraf
-    try {
-      await ctx.replyWithDocument({ source: buffer, filename: 'van_ban_tt.docx' });
-      return;
-    } catch (e) {
-      lastErr = e;
-    }
-    throw lastErr;
-  } catch (e) {
-    console.error('Lỗi xuất docx:', e);
-    await ctx.reply('Chưa gửi được file Word do đường truyền, NHÂN gõ /docx lại sau ít giây nhé.');
-  }
+// /vanban [nội dung hoặc yêu cầu] (/docx và /vb là lệnh tắt cùng chức năng)
+bot.command(['vanban', 'docx', 'vb'], (ctx) => {
+  const request = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/, '');
+  return makeFormalDoc(ctx, request);
 });
 
 // ===== TIN NHẮN VĂN BẢN =====
 bot.on('text', async (ctx) => {
+  const t = ctx.message.text;
+  if (FORMAL_RE.test(t)) return makeFormalDoc(ctx, t);
   try {
-    const t = ctx.message.text;
     const out = await withTyping(ctx, 'typing', () => ask(ctx.chat.id, [{ text: t }], t));
     await sendLong(ctx, out);
   } catch (e) {
@@ -366,7 +558,7 @@ http
     console.log('Server chạy cổng', PORT);
     try {
       await bot.telegram.setMyCommands([
-        { command: 'docx', description: 'Xuất văn bản vừa soạn ra file Word' },
+        { command: 'vanban', description: 'Trình bày văn bản theo thể thức, xuất file Word' },
         { command: 'reset', description: 'Xóa ngữ cảnh, bắt đầu việc mới' },
         { command: 'start', description: 'Xem hướng dẫn' },
       ]);
