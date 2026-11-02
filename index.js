@@ -461,6 +461,32 @@ async function makePlainDoc(ctx, request) {
   }
 }
 
+async function makeSummaryDoc(ctx, request) {
+  const id = ctx.chat.id;
+  const source = String(request || '').trim() || lastReply.get(id) || lastDoc.get(id) || '';
+  if (!source) {
+    return ctx.reply('NHÂN gửi ảnh hoặc file cần tóm tắt trước, rồi gõ /tomtat để nhận file Word không tiêu đề nhé.');
+  }
+  try {
+    const summary = await withTyping(ctx, 'typing', async () => {
+      const res = await callGemini([{ role: 'user', parts: [{
+        text: `Hãy tóm tắt nội dung dưới đây bằng tiếng Việt, ngắn gọn nhưng đủ ý, bám sát tài liệu, giữ nguyên số liệu và tên riêng. Chỉ trả về phần nội dung tóm tắt, không đặt tiêu đề, không thêm lời dẫn.\n\nNỘI DUNG:\n${clip(source)}`,
+      }] }], {
+        system: 'Bạn là trợ lý tóm tắt tài liệu. Chỉ trả về nội dung tóm tắt, không có tiêu đề.',
+      });
+      return (res.text || '').trim();
+    });
+    if (!summary) return ctx.reply('Em chưa tạo được nội dung tóm tắt. NHÂN thử lại giúp em nhé.');
+    const buffer = await buildPlainDoc(summary);
+    await ctx.sendChatAction('upload_document').catch(() => {});
+    await sendDocWithRetry(ctx, buffer, 'tom_tat_tt.docx');
+    await ctx.reply('Em đã gửi bản tóm tắt Word, không có tiêu đề.');
+  } catch (e) {
+    console.error('Lỗi tạo bản tóm tắt Word:', e);
+    await ctx.reply(friendlyError(e));
+  }
+}
+
 async function makeFormalDoc(ctx, request) {
   const id = ctx.chat.id;
   const prev = lastDoc.get(id) || lastReply.get(id) || '';
@@ -603,7 +629,6 @@ async function handleExcelFlowText(ctx, text) {
 const OFFICE_HELP = {
   wordvanbanhinhanh: 'Em đã sẵn sàng. NHÂN gửi file Word (.docx) có hình ảnh, em chỉnh ảnh đồng đều, căn giữa, không làm méo hình và không đổi nội dung chữ.',
   excel: 'Em đã sẵn sàng. NHÂN gửi file Excel (.xlsx), em kẻ bảng, căn chỉnh và đặt khổ A4 vừa trang in. Thêm chữ "ngang" hoặc "đứng" sau lệnh nếu muốn chọn hướng giấy.',
-  exceltinhtoan: 'Em đã sẵn sàng. NHÂN gửi file Excel (.xlsx) kèm yêu cầu tính toán ở phần chú thích (hoặc gõ yêu cầu ngay sau lệnh), ví dụ: tính thành tiền = SL x Đơn giá, tổng cột Thành tiền, giấy ngang. Em chỉ làm đúng yêu cầu, không tự thêm cột hay dòng tổng.',
 };
 
 async function handleOfficeFile(ctx, doc, cmd, args) {
@@ -626,22 +651,13 @@ async function handleOfficeFile(ctx, doc, cmd, args) {
             : 'File không có hình ảnh nội dòng để chỉnh, em gửi lại nguyên bản.',
         };
       }
-      if (cmd === 'exceltinhtoan' && args.replace(/\b(ngang|đứng|dọc)\b/gi, '').trim().length <= 3) {
-        return { ask: true };
-      }
       const orient = /ngang|landscape/i.test(args) ? 'ngang' : /đứng|dọc|portrait/i.test(args) ? 'doc' : null;
-      let spec = null;
-      if (cmd === 'exceltinhtoan') {
-        const preview = await office.excelPreview(src);
-        spec = await office.excelSpecFromAI(callGemini, preview, args);
-      }
-      const r = await office.processExcel(src, { orient, tinhToan: cmd === 'exceltinhtoan', spec });
+      const r = await office.processExcel(src, { orient, tinhToan: false });
       return {
         buffer: r.buffer,
-        note: 'Em đã xử lý xong. ' + r.info + (cmd === 'exceltinhtoan' ? '. Công thức Excel còn nguyên, NHÂN kiểm tra lại kết quả trước khi dùng.' : '. Chỉ căn chỉnh bảng, không thêm cột hay dòng tổng.'),
+        note: 'Em đã xử lý xong. ' + r.info + '. Chỉ căn chỉnh bảng, không thêm cột hay dòng tổng.',
       };
     });
-    if (res.ask) return ctx.reply('NHÂN chưa nêu yêu cầu tính toán. NHÂN gửi lại file kèm yêu cầu ở chú thích, ví dụ: tính thành tiền = SL x Đơn giá, tổng cột Thành tiền. Nếu chỉ cần căn chỉnh bảng thì dùng lệnh /excel.');
     const { buffer, note } = res;
     const ext = isWord ? '.docx' : '.xlsx';
     await sendDocWithRetry(ctx, buffer, name.replace(/\.[^.]+$/, '') + '_da_xu_ly' + ext);
@@ -652,7 +668,7 @@ async function handleOfficeFile(ctx, doc, cmd, args) {
   }
 }
 
-bot.command(['wordvanbanhinhanh', 'wordhvanbanhinhanh', 'excel', 'exceltinhtoan'], async (ctx) => {
+bot.command(['wordvanbanhinhanh', 'wordhvanbanhinhanh', 'excel'], async (ctx) => {
   const p = office.parseOfficeCommand(ctx.message.text);
   if (p?.cmd === 'excel') {
     const state = readExcelFlow(ctx.chat.id);
@@ -678,7 +694,7 @@ bot.start((ctx) =>
       '- Gửi file PDF, DOCX, XLSX, TXT, CSV hoặc ảnh chụp văn bản, ghi yêu cầu ở phần chú thích.\n' +
       '- Gửi tin nhắn thoại, em nghe và xử lý.\n\n' +
       'Muốn có file Word đúng thể thức văn bản: nhắn "trình bày theo thể thức văn bản" (kèm nội dung hoặc yêu cầu) hoặc gõ /vanban.\n' +
-      'Muốn file Word chỉ có nội dung, không tiêu đề: nhắn "xuất file word không tiêu đề" hoặc gõ /word.\n' +
+      'Muốn tóm tắt ảnh hoặc file thành Word không tiêu đề: gửi ảnh/file rồi gõ /tomtat.\n' +
       'Word có hình ảnh: gõ /wordvanbanhinhanh rồi gửi file (hoặc ghi lệnh ở chú thích khi gửi file).\n' +
       'Excel: gửi file .xlsx trước; em sẽ hỏi có cần tính toán không. Sau đó chọn /excel đứng hoặc /excel ngang để căn chỉnh khổ giấy.\n' +
       '/reset : xóa ngữ cảnh, bắt đầu việc mới'
@@ -695,16 +711,16 @@ bot.command('reset', (ctx) => {
   return ctx.reply('Đã xóa ngữ cảnh hội thoại.');
 });
 
-// /vanban [nội dung hoặc yêu cầu] (/docx và /vb là lệnh tắt cùng chức năng)
-bot.command(['vanban', 'docx', 'vb'], (ctx) => {
+// /vanban [nội dung hoặc yêu cầu] (/docx là lệnh tắt cùng chức năng)
+bot.command(['vanban', 'docx'], (ctx) => {
   const request = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/, '');
   return makeFormalDoc(ctx, request);
 });
 
-// /word [nội dung] : xuất file Word chỉ có nội dung, không Quốc hiệu - Tiêu ngữ
-bot.command('word', (ctx) => {
+// /tomtat [nội dung] : tóm tắt và xuất Word không tiêu đề
+bot.command('tomtat', (ctx) => {
   const request = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/, '');
-  return makePlainDoc(ctx, request);
+  return makeSummaryDoc(ctx, request);
 });
 
 // ===== TIN NHẮN VĂN BẢN =====
@@ -737,6 +753,7 @@ bot.on('document', async (ctx) => {
     if (doc.file_size > 20 * 1024 * 1024) return ctx.reply('File vượt 20MB, Telegram không cho bot tải.');
     try {
       const buffer = await withTyping(ctx, 'upload_document', () => downloadFile(ctx, doc.file_id));
+      lastReply.set(ctx.chat.id, await excelToText(buffer));
       saveExcelFlow(ctx.chat.id, {
         stage: 'ask_calculation',
         buffer,
@@ -874,10 +891,10 @@ http
     try {
       await bot.telegram.setMyCommands([
         { command: 'vanban', description: 'Trình bày văn bản theo thể thức, xuất file Word' },
-        { command: 'word', description: 'Xuất file Word chỉ có nội dung, không tiêu đề' },
+        { command: 'docx', description: 'Lệnh tắt của /vanban' },
+        { command: 'tomtat', description: 'Tóm tắt nội dung ảnh hoặc file, xuất Word không tiêu đề' },
         { command: 'wordvanbanhinhanh', description: 'Word có hình ảnh: chỉnh ảnh đồng đều, không méo' },
         { command: 'excel', description: 'Excel: định dạng bảng, khổ A4 đứng hoặc ngang' },
-        { command: 'exceltinhtoan', description: 'Excel: định dạng và tính toán theo yêu cầu' },
         { command: 'reset', description: 'Xóa ngữ cảnh, bắt đầu việc mới' },
         { command: 'start', description: 'Xem hướng dẫn' },
       ]);
