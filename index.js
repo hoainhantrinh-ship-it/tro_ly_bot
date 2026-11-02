@@ -393,6 +393,49 @@ async function sendDocWithRetry(ctx, buffer, filename) {
   throw lastErr;
 }
 
+// ===== XUẤT WORD THƯỜNG (không Quốc hiệu - Tiêu ngữ, chỉ nội dung) =====
+function buildPlainDoc(text) {
+  const paragraphs = String(text)
+    .split('\n')
+    .map(
+      (line) =>
+        new Paragraph({
+          alignment: AlignmentType.JUSTIFIED,
+          spacing: { after: 120, line: 360 },
+          children: [new TextRun({ text: line, font: FONT, size: 28 })],
+        })
+    );
+  const doc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            size: { width: 11906, height: 16838 },
+            margin: { top: 1134, bottom: 1134, left: 1985, right: 1134 },
+          },
+        },
+        children: paragraphs,
+      },
+    ],
+  });
+  return Packer.toBuffer(doc);
+}
+
+async function makePlainDoc(ctx, request) {
+  const id = ctx.chat.id;
+  const text = String(request).trim() || lastDoc.get(id) || lastReply.get(id) || '';
+  if (!text) return ctx.reply('Chưa có nội dung để xuất. NHÂN gửi nội dung hoặc nhờ em soạn trước nhé.');
+  try {
+    const buffer = await buildPlainDoc(text);
+    await ctx.sendChatAction('upload_document').catch(() => {});
+    await sendDocWithRetry(ctx, buffer, 'noi_dung_tt.docx');
+    await ctx.reply('Em đã gửi file Word, chỉ có nội dung, không có tiêu đề.');
+  } catch (e) {
+    console.error('Lỗi xuất docx thường:', e);
+    await ctx.reply('Chưa gửi được file Word do đường truyền, NHÂN nhắn lại lệnh sau ít giây nhé.');
+  }
+}
+
 async function makeFormalDoc(ctx, request) {
   const id = ctx.chat.id;
   const prev = lastDoc.get(id) || lastReply.get(id) || '';
@@ -427,6 +470,8 @@ async function makeFormalDoc(ctx, request) {
 // ===== LỆNH =====
 // Câu nói tự nhiên kích hoạt chế độ thể thức, ví dụ: "trình bày theo thể thức văn bản", "xuất file word"
 const FORMAL_RE = /(trình bày|soạn|xuất|tạo|làm|lập|chuyển)[^\n]{0,40}(thể thức|file word|file docx)/i;
+// Xuất Word chỉ có nội dung, KHÔNG tiêu đề: ví dụ "xuất file word không tiêu đề"
+const PLAIN_RE = /(xuất|tạo|làm|gửi|chuyển)[^\n]{0,40}(word|docx)[^\n]{0,40}(không\s+(có\s+)?(tiêu đề|thể thức|quốc hiệu)|chỉ (có )?nội dung|thông thường)/i;
 
 bot.start((ctx) =>
   ctx.reply(
@@ -435,6 +480,7 @@ bot.start((ctx) =>
       '- Gửi file PDF, DOCX, XLSX, TXT, CSV hoặc ảnh chụp văn bản, ghi yêu cầu ở phần chú thích.\n' +
       '- Gửi tin nhắn thoại, em nghe và xử lý.\n\n' +
       'Muốn có file Word đúng thể thức văn bản: nhắn "trình bày theo thể thức văn bản" (kèm nội dung hoặc yêu cầu) hoặc gõ /vanban.\n' +
+      'Muốn file Word chỉ có nội dung, không tiêu đề: nhắn "xuất file word không tiêu đề" hoặc gõ /word.\n' +
       '/reset : xóa ngữ cảnh, bắt đầu việc mới'
   )
 );
@@ -452,9 +498,16 @@ bot.command(['vanban', 'docx', 'vb'], (ctx) => {
   return makeFormalDoc(ctx, request);
 });
 
+// /word [nội dung] : xuất file Word chỉ có nội dung, không Quốc hiệu - Tiêu ngữ
+bot.command('word', (ctx) => {
+  const request = ctx.message.text.replace(/^\/\w+(@\w+)?\s*/, '');
+  return makePlainDoc(ctx, request);
+});
+
 // ===== TIN NHẮN VĂN BẢN =====
 bot.on('text', async (ctx) => {
   const t = ctx.message.text;
+  if (PLAIN_RE.test(t)) return makePlainDoc(ctx, '');
   if (FORMAL_RE.test(t)) return makeFormalDoc(ctx, t);
   try {
     const out = await withTyping(ctx, 'typing', () => ask(ctx.chat.id, [{ text: t }], t));
@@ -560,6 +613,7 @@ http
     try {
       await bot.telegram.setMyCommands([
         { command: 'vanban', description: 'Trình bày văn bản theo thể thức, xuất file Word' },
+        { command: 'word', description: 'Xuất file Word chỉ có nội dung, không tiêu đề' },
         { command: 'reset', description: 'Xóa ngữ cảnh, bắt đầu việc mới' },
         { command: 'start', description: 'Xem hướng dẫn' },
       ]);
