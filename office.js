@@ -255,6 +255,10 @@ function cloneStyle(from, to) {
 }
 
 const cleanFormula = (f) => String(f).trim().replace(/^=/, '');
+const isBlankCell = (cell) =>
+  cell.value === null ||
+  cell.value === undefined ||
+  (typeof cell.value === 'string' && cell.value.trim() === '');
 
 function applySpec(wb, spec) {
   const ops = Array.isArray(spec && spec.ops) ? spec.ops : [];
@@ -265,15 +269,21 @@ function applySpec(wb, spec) {
       if (!ws) continue;
       if (op.type === 'fill' && op.col && op.formula) {
         const from = Math.max(1, parseInt(op.from, 10) || 2);
-        const to = Math.min(from + 5000, parseInt(op.to, 10) || from);
+        const { lastRow } = usedRange(ws);
+        if (!lastRow || from > lastRow) throw new Error('Dòng bắt đầu phép tính nằm ngoài vùng dữ liệu.');
+        const requestedTo = parseInt(op.to, 10) || lastRow;
+        const to = Math.min(from + 5000, requestedTo, lastRow);
+        if (to < from) throw new Error('Vùng dòng tính toán không hợp lệ.');
         const colNum = ws.getColumn(String(op.col).toUpperCase()).number;
         if (op.header && from > 1) {
           const hc = ws.getCell(from - 1, colNum);
+          if (!isBlankCell(hc)) throw new Error(`Ô ${hc.address} đã có dữ liệu; không ghi đè.`);
           hc.value = String(op.header);
           if (colNum > 1) cloneStyle(ws.getCell(from - 1, colNum - 1), hc);
         }
         for (let r = from; r <= to; r++) {
           const cell = ws.getCell(r, colNum);
+          if (!isBlankCell(cell)) throw new Error(`Ô ${cell.address} đã có dữ liệu; không ghi đè.`);
           cell.value = { formula: cleanFormula(op.formula).replace(/\{r\}/g, String(r)) };
           if (colNum > 1) cloneStyle(ws.getCell(r, colNum - 1), cell);
           if (op.numFmt) cell.numFmt = String(op.numFmt);
@@ -281,6 +291,7 @@ function applySpec(wb, spec) {
         n++;
       } else if (op.type === 'cell' && op.cell) {
         const cell = ws.getCell(String(op.cell).toUpperCase());
+        if (!isBlankCell(cell)) throw new Error(`Ô ${cell.address} đã có dữ liệu; không ghi đè.`);
         if (op.formula) cell.value = { formula: cleanFormula(op.formula) };
         else if (op.value !== undefined) cell.value = op.value;
         else continue;
@@ -293,6 +304,7 @@ function applySpec(wb, spec) {
         n++;
       }
     } catch (e) {
+      if (/đã có dữ liệu|nằm ngoài vùng dữ liệu|vùng dòng tính toán không hợp lệ/i.test(String((e && e.message) || e))) throw e;
       console.warn('Bỏ qua 1 thao tác tính toán:', String((e && e.message) || e).slice(0, 100));
     }
   }
