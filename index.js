@@ -4,7 +4,7 @@ const https = require('https');
 const { Telegraf } = require('telegraf');
 const { GoogleGenAI } = require('@google/genai');
 const mammoth = require('mammoth');
-const XLSX = require('xlsx');
+const ExcelJS = require('exceljs');
 const {
   Document,
   Packer,
@@ -197,6 +197,30 @@ async function sendDocumentDirect(chatId, buffer, filename) {
 }
 
 const clip = (s) => (s.length > MAX_TEXT ? s.slice(0, MAX_TEXT) + '\n[...đã cắt bớt do quá dài]' : s);
+
+// Đọc .xlsx bằng ExcelJS để dùng chung thư viện với luồng xử lý Excel.
+async function excelToText(buffer) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  return workbook.worksheets.map((ws) => {
+    const rows = [];
+    ws.eachRow({ includeEmpty: false }, (row) => {
+      const values = row.values.slice(1).map((value) => {
+        if (value === null || value === undefined) return '';
+        if (value instanceof Date) return value.toLocaleDateString('vi-VN');
+        if (typeof value === 'object') {
+          if (Array.isArray(value.richText)) return value.richText.map((x) => x.text || '').join('');
+          if (value.text !== undefined) return String(value.text);
+          if (value.result !== undefined) return String(value.result ?? '');
+          if (value.formula) return '=' + value.formula;
+        }
+        return String(value);
+      });
+      rows.push(values.join('\t'));
+    });
+    return `--- Trang tính: ${ws.name} ---\n${rows.join('\n')}`;
+  }).join('\n\n');
+}
 
 // ===== XUẤT WORD THEO THỂ THỨC (Nghị định 30/2020/NĐ-CP) =====
 const FONT = 'Times New Roman';
@@ -470,6 +494,111 @@ async function makeFormalDoc(ctx, request) {
 
 // ===== WORD CÓ HÌNH ẢNH / EXCEL ĐỊNH DẠNG - TÍNH TOÁN =====
 const pendingOffice = new Map(); // chatId -> {cmd, args, at}: NHÂN gõ lệnh trước, gửi file sau
+const pendingExcelFlow = new Map(); // chatId -> {stage, buffer, filename, at, timer}
+const EXCEL_FLOW_TTL = 15 * 60 * 1000;
+
+function saveExcelFlow(chatId, data) {
+  const old = pendingExcelFlow.get(chatId);
+  if (old?.timer) clearTimeout(old.timer);
+  const state = { ...data, at: Date.now() };
+  state.timer = setTimeout(() => pendingExcelFlow.delete(chatId), EXCEL_FLOW_TTL);
+  state.timer.unref?.();
+  pendingExcelFlow.set(chatId, state);
+  return state;
+}
+
+function readExcelFlow(chatId) {
+  const state = pendingExcelFlow.get(chatId);
+  if (!state) return null;
+  if (Date.now() - state.at >= EXCEL_FLOW_TTL) {
+    if (state.timer) clearTimeout(state.timer);
+    pendingExcelFlow.delete(chatId);
+    return null;
+  }
+  return state;
+}
+
+async function runExcelCalculation(ctx, state, request) {
+  try {
+    const result = await withTyping(ctx, 'upload_document', async () => {
+      const preview = await office.excelPreview(state.buffer);
+      const spec = await office.excelSpecFromAI(callGemini, preview, request);
+      return office.processExcel(state.buffer, { tinhToan: true, spec });
+    });
+    saveExcelFlow(ctx.chat.id, {
+      stage: 'orientation',
+      buffer: result.buffer,
+      filename: state.filename,
+      calculated: true,
+    });
+    await ctx.reply(
+      `Em đã lập phép tính theo yêu cầu (${result.info}). NHÂN muốn đặt giấy đứng hay ngang? Gửi /excel đứng hoặc /excel ngang để hoàn tất. Excel sẽ tính kết quả khi NHÂN mở file.`
+    );
+  } catch (e) {
+    console.error('Lỗi tính toán Excel theo hội thoại:', e);
+    await ctx.reply(isTransient(errText(e)) ? friendlyError(e) : 'Em chưa thực hiện được phép tính: ' + errText(e).slice(0, 180));
+  }
+}
+
+async function finishExcelOrientation(ctx, state, args) {
+  const orient = /^(đứng|dọc|portrait)$/i.test(String(args).trim())
+    ? 'doc'
+    : /^(ngang|landscape)$/i.test(String(args).trim())
+      ? 'ngang'
+      : null;
+  if (!orient) return ctx.reply('NHÂN chọn hướng giấy bằng /excel đứng hoặc /excel ngang nhé.');
+  try {
+    const result = await withTyping(ctx, 'upload_document', () =>
+      office.processExcel(state.buffer, { orient, tinhToan: false })
+    );
+    await sendDocWithRetry(
+      ctx,
+      result.buffer,
+      (state.filename || 'bang_tinh.xlsx').replace(/\.xlsx$/i, '') + '_da_xu_ly.xlsx'
+    );
+    pendingExcelFlow.delete(ctx.chat.id);
+    if (state.timer) clearTimeout(state.timer);
+    await ctx.reply(`Em đã hoàn tất bảng Excel khổ giấy ${orient === 'ngang' ? 'ngang' : 'đứng'}. ${result.info}`);
+  } catch (e) {
+    console.error('Lỗi định dạng Excel theo hướng giấy:', e);
+    await ctx.reply(isTransient(errText(e)) ? friendlyError(e) : 'Em chưa định dạng được file: ' + errText(e).slice(0, 180));
+  }
+}
+
+async function handleExcelFlowText(ctx, text) {
+  const state = readExcelFlow(ctx.chat.id);
+  if (!state) return false;
+  const t = String(text || '').trim();
+  if (state.stage === 'orientation') {
+    await ctx.reply('NHÂN gửi /excel đứng hoặc /excel ngang để nhận file hoàn chỉnh nhé.');
+    return true;
+  }
+  if (state.stage === 'calculation_request') {
+    await runExcelCalculation(ctx, state, t);
+    return true;
+  }
+
+  const yes = /^(có|co|có nhé|đồng ý|muốn|có,?.*)$/i.test(t);
+  const no = /^(không|khong|không cần|không tính(?: toán)?|không,?.*)$/i.test(t);
+  if (no) {
+    saveExcelFlow(ctx.chat.id, { ...state, stage: 'orientation' });
+    await ctx.reply('Dạ. NHÂN chọn hướng giấy bằng /excel đứng hoặc /excel ngang để em căn chỉnh và gửi file nhé.');
+    return true;
+  }
+  if (yes) {
+    const request = t.replace(/^(có|co|có nhé|đồng ý|muốn)\s*[, :]*/i, '').trim();
+    if (request) {
+      await runExcelCalculation(ctx, state, request);
+    } else {
+      saveExcelFlow(ctx.chat.id, { ...state, stage: 'calculation_request' });
+      await ctx.reply('NHÂN ghi phép tính cần làm bằng tiếng Việt nhé, ví dụ: tính thành tiền bằng số lượng nhân đơn giá, rồi tính tổng cột thành tiền.');
+    }
+    return true;
+  }
+  // Cho phép NHÂN trả lời thẳng phép tính mà không cần gõ riêng chữ “có”.
+  await runExcelCalculation(ctx, state, t);
+  return true;
+}
 
 const OFFICE_HELP = {
   wordvanbanhinhanh: 'Em đã sẵn sàng. NHÂN gửi file Word (.docx) có hình ảnh, em chỉnh ảnh đồng đều, căn giữa, không làm méo hình và không đổi nội dung chữ.',
@@ -523,8 +652,15 @@ async function handleOfficeFile(ctx, doc, cmd, args) {
   }
 }
 
-bot.command(['wordvanbanhinhanh', 'wordhvanbanhinhanh', 'excel', 'exceltinhtoan'], (ctx) => {
+bot.command(['wordvanbanhinhanh', 'wordhvanbanhinhanh', 'excel', 'exceltinhtoan'], async (ctx) => {
   const p = office.parseOfficeCommand(ctx.message.text);
+  if (p?.cmd === 'excel') {
+    const state = readExcelFlow(ctx.chat.id);
+    if (state?.stage === 'orientation') return finishExcelOrientation(ctx, state, p.args);
+    if (state?.stage === 'ask_calculation' || state?.stage === 'calculation_request') {
+      return ctx.reply('NHÂN trả lời bot có muốn tính không và nêu phép tính trước nhé. Sau đó mình chọn hướng giấy bằng /excel đứng hoặc /excel ngang.');
+    }
+  }
   pendingOffice.set(ctx.chat.id, { cmd: p.cmd, args: p.args, at: Date.now() });
   return ctx.reply(OFFICE_HELP[p.cmd]);
 });
@@ -544,7 +680,7 @@ bot.start((ctx) =>
       'Muốn có file Word đúng thể thức văn bản: nhắn "trình bày theo thể thức văn bản" (kèm nội dung hoặc yêu cầu) hoặc gõ /vanban.\n' +
       'Muốn file Word chỉ có nội dung, không tiêu đề: nhắn "xuất file word không tiêu đề" hoặc gõ /word.\n' +
       'Word có hình ảnh: gõ /wordvanbanhinhanh rồi gửi file (hoặc ghi lệnh ở chú thích khi gửi file).\n' +
-      'Excel: /excel (định dạng thường) hoặc /exceltinhtoan (kèm yêu cầu tính toán), có thể thêm "ngang" hoặc "đứng".\n' +
+      'Excel: gửi file .xlsx trước; em sẽ hỏi có cần tính toán không. Sau đó chọn /excel đứng hoặc /excel ngang để căn chỉnh khổ giấy.\n' +
       '/reset : xóa ngữ cảnh, bắt đầu việc mới'
   )
 );
@@ -553,6 +689,9 @@ bot.command('reset', (ctx) => {
   history.delete(ctx.chat.id);
   lastReply.delete(ctx.chat.id);
   lastDoc.delete(ctx.chat.id);
+  const excelFlow = pendingExcelFlow.get(ctx.chat.id);
+  if (excelFlow?.timer) clearTimeout(excelFlow.timer);
+  pendingExcelFlow.delete(ctx.chat.id);
   return ctx.reply('Đã xóa ngữ cảnh hội thoại.');
 });
 
@@ -571,6 +710,7 @@ bot.command('word', (ctx) => {
 // ===== TIN NHẮN VĂN BẢN =====
 bot.on('text', async (ctx) => {
   const t = ctx.message.text;
+  if (await handleExcelFlowText(ctx, t)) return;
   if (PLAIN_RE.test(t)) return makePlainDoc(ctx, '');
   if (FORMAL_RE.test(t)) return makeFormalDoc(ctx, t);
   try {
@@ -593,6 +733,21 @@ bot.on('document', async (ctx) => {
     const c = capCmd || pend;
     return handleOfficeFile(ctx, doc, c.cmd, c.args);
   }
+  if ((doc.file_name || '').toLowerCase().endsWith('.xlsx')) {
+    if (doc.file_size > 20 * 1024 * 1024) return ctx.reply('File vượt 20MB, Telegram không cho bot tải.');
+    try {
+      const buffer = await withTyping(ctx, 'upload_document', () => downloadFile(ctx, doc.file_id));
+      saveExcelFlow(ctx.chat.id, {
+        stage: 'ask_calculation',
+        buffer,
+        filename: doc.file_name || 'bang_tinh.xlsx',
+      });
+      return ctx.reply('NHÂN có muốn tính toán trong bảng Excel này không? Trả lời “có” rồi ghi phép tính bằng tiếng Việt, hoặc “không”. Sau đó bot sẽ hỏi hướng giấy để NHÂN chọn /excel đứng hoặc /excel ngang.');
+    } catch (e) {
+      console.error('Lỗi nhận file Excel:', e);
+      return ctx.reply(friendlyError(e));
+    }
+  }
   const req = ctx.message.caption || 'Tóm tắt các điểm chính của tài liệu này.';
   if (doc.file_size > 20 * 1024 * 1024) {
     return ctx.reply('File vượt 20MB, Telegram không cho bot tải.');
@@ -611,9 +766,8 @@ bot.on('document', async (ctx) => {
       } else if (name.endsWith('.docx')) {
         const { value } = await mammoth.extractRawText({ buffer: buf });
         parts = [{ text: `Nội dung file ${doc.file_name}:\n${clip(value)}\n\nYêu cầu: ${req}` }];
-      } else if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
-        const wb = XLSX.read(buf, { type: 'buffer' });
-        const txt = wb.SheetNames.map((n) => `--- Trang tính: ${n} ---\n${XLSX.utils.sheet_to_csv(wb.Sheets[n])}`).join('\n\n');
+      } else if (name.endsWith('.xlsx')) {
+        const txt = await excelToText(buf);
         parts = [{ text: `Nội dung file Excel ${doc.file_name}:\n${clip(txt)}\n\nYêu cầu: ${req}` }];
       } else if (name.endsWith('.txt') || name.endsWith('.csv')) {
         parts = [{ text: `Nội dung file ${doc.file_name}:\n${clip(buf.toString('utf8'))}\n\nYêu cầu: ${req}` }];
@@ -624,7 +778,7 @@ bot.on('document', async (ctx) => {
       }
       return ask(ctx.chat.id, parts, `[Đã gửi file ${doc.file_name}] ${req}`);
     });
-    if (out === null) return ctx.reply('Hiện hỗ trợ: PDF, DOCX, XLSX, TXT, CSV và ảnh. File DOC, PPTX NHÂN lưu lại thành DOCX hoặc PDF rồi gửi nhé.');
+    if (out === null) return ctx.reply('Hiện hỗ trợ: PDF, DOCX, XLSX, TXT, CSV và ảnh. File XLS, DOC, PPTX NHÂN lưu lại thành XLSX, DOCX hoặc PDF rồi gửi nhé.');
     await sendLong(ctx, out);
   } catch (e) {
     console.error('Lỗi xử lý file:', e);
