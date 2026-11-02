@@ -5,9 +5,7 @@ const JSZip = require('jszip');
 // ===== NHẬN DIỆN LỆNH =====
 const CMD_ALIAS = {
   wordvanbanhinhanh: 'wordvanbanhinhanh',
-  wordhvanbanhinhanh: 'wordvanbanhinhanh',
   excel: 'excel',
-  exceltinhtoan: 'exceltinhtoan',
 };
 
 function parseOfficeCommand(text) {
@@ -235,6 +233,27 @@ function formatSheet(ws, orientOpt) {
   };
   ws.pageSetup.printArea = `A1:${ws.getColumn(lastCol).letter}${lastRow}`;
   if (end - head > 35) ws.pageSetup.printTitlesRow = `${head}:${head}`;
+
+  // Đặt ngắt trang ở ranh giới giữa các hàng để hạn chế một hàng bị tách đôi khi in.
+  if (end > head + 1) {
+    const pageHeightIn = land ? 8.27 : 11.69;
+    const usableHeight = pageHeightIn * 72 - (0.79 + 0.79) * 72;
+    const pageWidthIn = land ? 11.69 : 8.27;
+    const usableWidth = pageWidthIn * 72 - (0.79 + 0.59) * 72;
+    const scale = Math.min(1, usableWidth / Math.max(1, total * 5.25));
+    const headerHeight = (ws.getRow(head).height || 15) * scale;
+    let usedHeight = headerHeight;
+    let pageFirstRow = head + 1;
+    for (let r = head + 1; r <= end; r++) {
+      const rowHeight = (ws.getRow(r).height || 15) * scale;
+      if (usedHeight + rowHeight > usableHeight && r > pageFirstRow) {
+        ws.getRow(r - 1).addPageBreak();
+        usedHeight = headerHeight;
+        pageFirstRow = r;
+      }
+      usedHeight += rowHeight;
+    }
+  }
   return { land };
 }
 
@@ -332,7 +351,7 @@ async function processExcel(buf, opts = {}) {
       }
     });
     if (!done) throw new Error('File Excel không có dữ liệu để căn chỉnh');
-    info = `Đã kẻ bảng, căn chỉnh và đặt khổ A4 ${[...lands].join('/')}, vừa 1 trang theo chiều ngang (${done} trang tính). Lề trên, dưới, trái 2 cm, phải 1,5 cm`;
+    info = `Đã kẻ bảng, căn chỉnh và đặt khổ A4 ${[...lands].join('/')}, vừa 1 trang theo chiều ngang, ngắt trang tại ranh giới hàng (${done} trang tính). Lề trên, dưới, trái 2 cm, phải 1,5 cm`;
   }
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
   return { buffer, info };
