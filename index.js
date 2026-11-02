@@ -352,7 +352,8 @@ Quy tắc:
 - Bám sát 100% số liệu, dữ liệu NHÂN cung cấp; không tự thêm bớt, không bịa. Chỗ thiếu thông tin ghi "......".
 - Không dùng ký hiệu markdown (như ** hoặc #).
 - Nếu yêu cầu có nội dung riêng thì dùng nội dung đó; nếu không có thì dùng "VĂN BẢN GẦN NHẤT" bên dưới.
-- Nếu hoàn toàn không có nội dung để trình bày, chỉ trả về {"thieu":"một câu hỏi ngắn gọn gửi NHÂN"}.`;
+- Luôn trình bày thành văn bản hoàn chỉnh theo thể thức, kể cả khi nội dung NHÂN đưa chưa phải văn bản hành chính (tin nhắn, ý tưởng, tóm tắt, khẩu hiệu, ghi chú...). Khi đó tự chọn loại văn bản phù hợp nhất (nếu NHÂN không nêu loại thì dùng BÁO CÁO), tự viết trích yếu và sắp xếp nội dung thành các mục rõ ràng, giữ nguyên ý và số liệu, không bịa thêm.
+- Chỉ trả về {"thieu":"một câu hỏi ngắn gọn gửi NHÂN"} khi hoàn toàn không có bất kỳ nội dung nào, kể cả "VĂN BẢN GẦN NHẤT" cũng trống.`;
 
 async function structureDoc(request, prev) {
   const prompt =
