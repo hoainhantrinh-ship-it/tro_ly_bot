@@ -1,259 +1,389 @@
-// office.js - xử lý file Word có hình ảnh và định dạng/tính toán Excel cho bot tt
-// Cần cài thêm: npm install jszip exceljs
-const JSZip = require('jszip');
+'use strict';
 const ExcelJS = require('exceljs');
+const JSZip = require('jszip');
 
-// ======================= PHẦN CHUNG =======================
-const CMD_RE = /^\/(wordvanbanhinhanh|wordhvanbanhinhanh|exceltinhtoan|excel)(?:@\w+)?(?:\s+([\s\S]*))?$/i;
+// ===== NHẬN DIỆN LỆNH =====
+const CMD_ALIAS = {
+  wordvanbanhinhanh: 'wordvanbanhinhanh',
+  wordhvanbanhinhanh: 'wordvanbanhinhanh',
+  excel: 'excel',
+  exceltinhtoan: 'exceltinhtoan',
+};
+
 function parseOfficeCommand(text) {
-  const m = CMD_RE.exec(String(text || '').trim());
+  const m = String(text || '').trim().match(/^\/([A-Za-z0-9_]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
   if (!m) return null;
-  let cmd = m[1].toLowerCase();
-  if (cmd === 'wordhvanbanhinhanh') cmd = 'wordvanbanhinhanh';
+  const cmd = CMD_ALIAS[m[1].toLowerCase()];
+  if (!cmd) return null;
   return { cmd, args: (m[2] || '').trim() };
 }
 
-// ======================= WORD CÓ HÌNH ẢNH =======================
-// Khung ảnh chuẩn: 10 cm x 7,5 cm (EMU). Ảnh được cắt khung, không kéo giãn nên không méo.
-const FW = 3600000;
-const FH = 2700000;
-const V_BIAS = 0.35; // 0 = lấy phần trên, 0.5 = lấy giữa
+// ===== WORD: CHỈNH ẢNH + KHỔ GIẤY, LỀ THEO NGHỊ ĐỊNH 30 =====
+const EMU_W = 3600000; // 10 cm
+const EMU_H = 2700000; // 7,5 cm
 
-function imgSize(buf) {
-  try {
-    if (buf[0] === 0x89 && buf[1] === 0x50) return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) }; // PNG
-    if (buf[0] === 0xff && buf[1] === 0xd8) { // JPEG
-      let i = 2;
-      while (i < buf.length) {
-        if (buf[i] !== 0xff) { i++; continue; }
-        const mk = buf[i + 1];
-        if (mk >= 0xc0 && mk <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(mk)) {
-          return { h: buf.readUInt16BE(i + 5), w: buf.readUInt16BE(i + 7) };
-        }
-        i += 2 + buf.readUInt16BE(i + 2);
-      }
-    }
-  } catch (e) { /* bỏ qua */ }
-  return null;
+function insertBefore(inner, xml, tags) {
+  const re = new RegExp('<w:(?:' + tags.join('|') + ')[\\s/>]');
+  const m = inner.match(re);
+  if (!m) return inner + xml;
+  return inner.slice(0, m.index) + xml + inner.slice(m.index);
 }
+const AFTER_IND = ['contextualSpacing', 'mirrorIndents', 'suppressOverlap', 'jc', 'textDirection', 'textAlignment', 'textboxTightWrap', 'outlineLvl', 'divId', 'cnfStyle', 'rPr', 'sectPr', 'pPrChange'];
+const AFTER_JC = ['textDirection', 'textAlignment', 'textboxTightWrap', 'outlineLvl', 'divId', 'cnfStyle', 'rPr', 'sectPr', 'pPrChange'];
 
-const PARA_RE = /<w:p(?:\s[^>]*)?>(?:(?!<\/w:p>)[\s\S])*?<\/w:p>/g;
-const PPR_IMG =
-  '<w:pPr><w:spacing w:before="120" w:after="120" w:line="240" w:lineRule="auto"/>' +
-  '<w:ind w:left="0" w:right="0" w:firstLine="0"/><w:jc w:val="center"/></w:pPr>';
+function centerParagraph(p) {
+  const open = p.match(/^<w:p(?:\s[^>]*)?>/)[0];
+  let rest = p.slice(open.length).replace(/^<w:pPr\s*\/>/, '');
+  const IND = '<w:ind w:left="0" w:right="0" w:firstLine="0"/>';
+  const JC = '<w:jc w:val="center"/>';
+  const m = rest.match(/^<w:pPr>([\s\S]*?)<\/w:pPr>/);
+  if (!m) return open + '<w:pPr>' + IND + JC + '</w:pPr>' + rest;
+  let inner = m[1].replace(/<w:ind\b[^>]*\/>/g, '').replace(/<w:jc\b[^>]*\/>/g, '');
+  inner = insertBefore(inner, IND, AFTER_IND);
+  inner = insertBefore(inner, JC, AFTER_JC);
+  return open + '<w:pPr>' + inner + '</w:pPr>' + rest.slice(m[0].length);
+}
 
 async function fixWordImages(buf) {
   const zip = await JSZip.loadAsync(buf);
-  let xml = await zip.file('word/document.xml').async('string');
-  const relsXml = await zip.file('word/_rels/document.xml.rels').async('string');
-  const rels = {};
-  for (const m of relsXml.matchAll(/<Relationship\b[^>]*>/g)) {
-    const id = /\bId="([^"]+)"/.exec(m[0]);
-    const tg = /\bTarget="([^"]+)"/.exec(m[0]);
-    if (id && tg) rels[id[1]] = tg[1];
-  }
-  // đọc kích thước thật của từng ảnh
-  const sizes = {};
-  for (const m of xml.matchAll(/r:embed="([^"]+)"/g)) {
-    const rid = m[1];
-    if (sizes[rid] !== undefined || !rels[rid]) continue;
-    const path = 'word/' + rels[rid].replace(/^\.?\//, '');
-    const f = zip.file(path);
-    sizes[rid] = f ? imgSize(Buffer.from(await f.async('uint8array'))) : null;
-  }
-
+  const f = zip.file('word/document.xml');
+  if (!f) throw new Error('File Word không hợp lệ');
+  let xml = await f.async('string');
   let count = 0;
-  const fixDrawing = (d) => {
-    const rid = (/r:embed="([^"]+)"/.exec(d) || [])[1];
-    const s = sizes[rid];
-    let w = FW, h = FH, crop = '';
-    if (s && s.w && s.h) {
-      const r = s.w / s.h, t = FW / FH;
-      if (r < t) { // ảnh đứng: cắt trên/dưới
-        const cut = (1 - r / t) * 100000;
-        crop = `<a:srcRect t="${Math.round(cut * V_BIAS)}" b="${Math.round(cut * (1 - V_BIAS))}"/>`;
-      } else if (r > t) { // ảnh quá ngang: cắt hai bên
-        const cut = (1 - t / r) * 100000;
-        crop = `<a:srcRect l="${Math.round(cut / 2)}" r="${Math.round(cut / 2)}"/>`;
-      }
-    } else { // không đọc được kích thước: giữ tỉ lệ hiện có, thu vào khung
-      const e = /<wp:extent cx="(\d+)" cy="(\d+)"/.exec(d);
-      if (e) { const k = Math.min(FW / +e[1], FH / +e[2]); w = Math.round(+e[1] * k); h = Math.round(+e[2] * k); }
-    }
-    d = d.replace(/<wp:extent[^>]*\/>/, `<wp:extent cx="${w}" cy="${h}"/>`);
-    d = d.replace(/<wp:effectExtent[^>]*\/>/, '<wp:effectExtent l="0" t="0" r="0" b="0"/>');
-    d = d.replace(/<a:ext cx="\d+" cy="\d+"\/>/g, `<a:ext cx="${w}" cy="${h}"/>`);
-    d = d.replace(/<a:srcRect[^>]*\/>/g, '');
-    if (crop) d = d.replace(/(<a:blip\b[^>]*?\/>|<a:blip\b[^>]*>[\s\S]*?<\/a:blip>)/, (x) => x + crop);
-    count++;
-    return d;
-  };
 
-  xml = xml.replace(PARA_RE, (p) => {
-    if (!p.includes('<wp:inline') || p.includes('<w:txbxContent')) return p;
-    p = p.replace(/<wp:inline\b[\s\S]*?<\/wp:inline>/g, fixDrawing);
-    const hasText = /<w:t(?:\s[^>]*)?>\s*[^<\s][^<]*<\/w:t>/.test(p);
-    if (!hasText && !/<w:sectPr/.test(p)) {
-      if (/<w:pPr>[\s\S]*?<\/w:pPr>/.test(p)) p = p.replace(/<w:pPr>[\s\S]*?<\/w:pPr>/, PPR_IMG);
-      else p = p.replace(/^(<w:p(?:\s[^>]*)?>)/, '$1' + PPR_IMG);
+  xml = xml.replace(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g, (p) => {
+    if (!p.includes('<wp:inline')) return p;
+    let n = 0;
+    let out = p.replace(/<wp:inline\b[\s\S]*?<\/wp:inline>/g, (blk) => {
+      const e = blk.match(/<wp:extent\s+cx="(\d+)"\s+cy="(\d+)"\s*\/>/);
+      if (!e) return blk;
+      const cx = +e[1];
+      const cy = +e[2];
+      if (!cx || !cy) return blk;
+      const s = Math.min(EMU_W / cx, EMU_H / cy); // giữ nguyên tỉ lệ, không méo
+      const nx = Math.round(cx * s);
+      const ny = Math.round(cy * s);
+      n++;
+      return blk
+        .replace(/<wp:extent\s+cx="\d+"\s+cy="\d+"\s*\/>/, `<wp:extent cx="${nx}" cy="${ny}"/>`)
+        .replace(/<a:ext\s+cx="\d+"\s+cy="\d+"\s*\/>/g, `<a:ext cx="${nx}" cy="${ny}"/>`);
+    });
+    if (!n) return p;
+    count += n;
+    const hasText = /<w:t(?:\s[^>]*)?>[^<]+<\/w:t>/.test(out);
+    if (!hasText) out = centerParagraph(out); // đoạn chỉ có ảnh thì căn giữa
+    return out;
+  });
+
+  // Khổ A4 đứng, lề: trên 2cm, dưới 2cm, trái 3cm, phải 1,5cm (không đổi nếu văn bản đang để giấy ngang)
+  xml = xml.replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>/g, (s) => {
+    const sz = s.match(/<w:pgSz\b[^>]*>/);
+    if (sz) {
+      const w = +((sz[0].match(/w:w="(\d+)"/) || [])[1] || 0);
+      const h = +((sz[0].match(/w:h="(\d+)"/) || [])[1] || 0);
+      if (w && h && w > h) return s;
     }
-    return p;
+    let out = s;
+    if (sz) out = out.replace(/<w:pgSz\b[^>]*>/, '<w:pgSz w:w="11906" w:h="16838"/>');
+    out = out.replace(
+      /<w:pgMar\b[^>]*>/,
+      '<w:pgMar w:top="1134" w:right="851" w:bottom="1134" w:left="1701" w:header="567" w:footer="567" w:gutter="0"/>'
+    );
+    return out;
   });
 
   zip.file('word/document.xml', xml);
-  const out = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-  return { buffer: out, count };
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  return { buffer, count };
 }
 
-// ======================= EXCEL =======================
-const ALLOWED_FN = ['SUM', 'AVERAGE', 'MAX', 'MIN', 'COUNT'];
-const thin = { style: 'thin', color: { argb: 'FF000000' } };
-const BORDER = { top: thin, left: thin, bottom: thin, right: thin };
-const colLetter = (n) => { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
-const colNumber = (L) => String(L).toUpperCase().split('').reduce((a, c) => a * 26 + c.charCodeAt(0) - 64, 0);
-const cellText = (c) => { try { return String(c.text ?? '').trim(); } catch (e) { return ''; } };
-const isNum = (c) => typeof c.value === 'number' || (c.value && typeof c.value === 'object' && typeof c.value.result === 'number');
-const numVal = (c) => (typeof c.value === 'number' ? c.value : c.value && typeof c.value.result === 'number' ? c.value.result : null);
-const SKIP_HEAD = /^(stt|tt|số\s*tt|số thứ tự|no\.?)$/i;
+// ===== EXCEL: HÀM DÙNG CHUNG =====
+const pad = (n) => String(n).padStart(2, '0');
 
-// Mô tả bảng để gửi cho AI (tối đa 60 dòng đầu)
-async function excelPreview(buf) {
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buf);
-  const ws = wb.worksheets[0];
-  const lines = [`Trang tính: ${ws.name}; tổng ${ws.rowCount} dòng, ${ws.columnCount} cột`];
-  for (let r = 1; r <= Math.min(ws.rowCount, 60); r++) {
-    const row = ws.getRow(r), parts = [];
-    for (let c = 1; c <= ws.columnCount; c++) { const t = cellText(row.getCell(c)); if (t) parts.push(`${colLetter(c)}=${t}`); }
-    if (parts.length) lines.push(`Dòng ${r}: ${parts.join(' | ')}`);
+function cellText(c) {
+  const v = c.value;
+  if (v === null || v === undefined) return '';
+  if (v instanceof Date) return `${pad(v.getUTCDate())}/${pad(v.getUTCMonth() + 1)}/${v.getUTCFullYear()}`;
+  if (typeof v === 'object' && (v.formula || v.sharedFormula)) {
+    const r = v.result === undefined || v.result === null ? '' : ' -> ' + v.result;
+    return '=' + (v.formula || '(công thức dùng chung)') + r;
   }
-  return lines.join('\n');
+  try {
+    return String(c.text === undefined || c.text === null ? '' : c.text);
+  } catch (e) {
+    return '';
+  }
 }
 
-const SPEC_PROMPT = `Bạn nhận bảng Excel và yêu cầu tính toán của NHÂN. CHỈ trả về JSON hợp lệ:
-{
-  "header_rows": số dòng tiêu đề tính từ dòng 1 (mặc định 1; dòng cuối của phần này là dòng tên cột),
-  "data_end_row": dòng dữ liệu cuối cùng (không tính dòng tổng có sẵn nếu có),
-  "new_columns": [ {"header": "tên cột mới", "formula": "công thức cho từng dòng, dùng {r} thay số dòng, ví dụ =C{r}*D{r}"} ],
-  "summary": [ {"label": "Tổng cộng", "label_col": "A", "cells": {"E": "SUM", "F": "AVERAGE"}} ],
-  "orientation": "doc hoặc ngang hoặc rỗng nếu NHÂN không nêu"
-}
-Quy tắc: chỉ dùng hàm SUM, AVERAGE, MAX, MIN, COUNT trong "summary". Cột mới nằm sau cột cuối hiện có, nên cột tổng cho cột mới dùng chữ cái cột kế tiếp. Chỉ làm đúng điều NHÂN yêu cầu, không tự thêm. Không có gì cần thêm thì để mảng rỗng. Không dùng markdown.`;
-
-async function excelSpecFromAI(callGemini, preview, request) {
-  const res = await callGemini(
-    [{ role: 'user', parts: [{ text: `${SPEC_PROMPT}\n\nYÊU CẦU CỦA NHÂN:\n${request}\n\nBẢNG:\n${preview}` }] }],
-    { system: 'Bạn là chuyên viên Excel. Chỉ trả về JSON.', json: true }
-  );
-  const raw = (res.text || '').replace(/```json|```/g, '').trim();
-  try { return JSON.parse(raw); } catch (e) { const m = raw.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error('AI trả về sai định dạng'); }
+function rowHasValue(row) {
+  let has = false;
+  row.eachCell({ includeEmpty: false }, (c) => {
+    if (cellText(c) !== '') has = true;
+  });
+  return has;
 }
 
-const SAFE_FORMULA = /^=?[A-Za-z0-9_+\-*/^().,:$ %<>=&"{}]+$/;
+function usedRange(ws) {
+  let lastRow = 0;
+  let lastCol = 0;
+  ws.eachRow({ includeEmpty: false }, (row, r) => {
+    row.eachCell({ includeEmpty: false }, (c, col) => {
+      if (cellText(c) !== '') {
+        lastRow = Math.max(lastRow, r);
+        lastCol = Math.max(lastCol, col);
+      }
+    });
+  });
+  return { lastRow, lastCol };
+}
 
-// opts: { orient: 'doc'|'ngang'|null, tinhToan: bool, spec: object|null }
-// Không có spec (không có yêu cầu tính toán) thì chỉ căn chỉnh bảng, KHÔNG thêm cột/dòng tổng.
+// ===== EXCEL: CĂN CHỈNH BẢNG THEO KHỔ A4 =====
+function findHeaderRow(ws, lastCol) {
+  const need = Math.max(2, Math.ceil(lastCol * 0.6));
+  const maxR = Math.min(ws.rowCount, 30);
+  for (let r = 1; r <= maxR; r++) {
+    let cnt = 0;
+    ws.getRow(r).eachCell({ includeEmpty: false }, (c) => {
+      if (c.isMerged && c.master !== c) return;
+      if (cellText(c) !== '') cnt++;
+    });
+    if (cnt >= need) return r;
+  }
+  return 1;
+}
+
+function formatSheet(ws, orientOpt) {
+  const { lastRow, lastCol } = usedRange(ws);
+  if (!lastRow || !lastCol) return null;
+  const head = findHeaderRow(ws, lastCol);
+  let end = head;
+  for (let r = head + 1; r <= lastRow; r++) {
+    if (!rowHasValue(ws.getRow(r))) break; // dòng trống: hết bảng
+    end = r;
+  }
+
+  const thin = { style: 'thin', color: { argb: 'FF000000' } };
+  const border = { top: thin, left: thin, bottom: thin, right: thin };
+  const sttCol = /^(stt|tt|số\s*tt|số thứ tự)$/i.test(cellText(ws.getCell(head, 1)).trim());
+
+  for (let r = head; r <= end; r++) {
+    for (let c = 1; c <= lastCol; c++) {
+      const cell = ws.getCell(r, c);
+      cell.border = border;
+      if (r === head) {
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        cell.font = { ...(cell.font || {}), bold: true };
+      } else {
+        const v = cell.value;
+        const isDate = v instanceof Date;
+        const isNum =
+          typeof v === 'number' ||
+          (v && typeof v === 'object' && v.formula !== undefined && typeof v.result === 'number');
+        let h = 'left';
+        if (c === 1 && sttCol) h = 'center';
+        else if (isDate) h = 'center';
+        else if (isNum) h = 'right';
+        cell.alignment = { horizontal: h, vertical: 'middle', wrapText: true };
+      }
+    }
+  }
+
+  // Độ rộng cột theo nội dung
+  for (let c = 1; c <= lastCol; c++) {
+    let w = 0;
+    let hw = 0;
+    for (let r = head; r <= end; r++) {
+      const cell = ws.getCell(r, c);
+      if (cell.isMerged) continue;
+      const len = Math.max(0, ...cellText(cell).split('\n').map((s) => s.length));
+      if (r === head) hw = Math.max(hw, len);
+      else w = Math.max(w, len);
+    }
+    const min = c === 1 && sttCol ? 5 : 6;
+    ws.getColumn(c).width = Math.min(40, Math.max(min, Math.max(w, Math.min(hw, 14)) * 1.15 + 2));
+  }
+
+  // Chiều cao dòng khi chữ xuống dòng
+  for (let r = head; r <= end; r++) {
+    const row = ws.getRow(r);
+    let need = 0;
+    for (let c = 1; c <= lastCol; c++) {
+      const cell = ws.getCell(r, c);
+      if (cell.isMerged) continue;
+      const wcol = ws.getColumn(c).width || 8.43;
+      const lines = cellText(cell)
+        .split('\n')
+        .reduce((a, s) => a + Math.max(1, Math.ceil(s.length / Math.max(1, wcol - 1))), 0);
+      const size = (cell.font && cell.font.size) || 11;
+      need = Math.max(need, lines > 1 ? lines * size * 1.35 : 0);
+    }
+    if (need) row.height = Math.max(need, row.height || 0);
+  }
+
+  // Khổ giấy A4
+  let total = 0;
+  for (let c = 1; c <= lastCol; c++) total += ws.getColumn(c).width || 8.43;
+  const land = orientOpt === 'ngang' ? true : orientOpt === 'doc' ? false : total > 90;
+  ws.pageSetup = {
+    paperSize: 9,
+    orientation: land ? 'landscape' : 'portrait',
+    fitToPage: true,
+    fitToWidth: 1,
+    fitToHeight: 0,
+    horizontalCentered: true,
+    margins: { left: 0.79, right: 0.59, top: 0.79, bottom: 0.79, header: 0.3, footer: 0.3 },
+  };
+  ws.pageSetup.printArea = `A1:${ws.getColumn(lastCol).letter}${lastRow}`;
+  if (end - head > 35) ws.pageSetup.printTitlesRow = `${head}:${head}`;
+  return { land };
+}
+
+// ===== EXCEL: TÍNH TOÁN THEO LỆNH TIẾNG VIỆT =====
+function getWs(wb, name, create) {
+  const found = name ? wb.getWorksheet(String(name)) : null;
+  if (found) return found;
+  if (create && name) return wb.addWorksheet(String(name).slice(0, 31));
+  return wb.worksheets[0];
+}
+
+function cloneStyle(from, to) {
+  try {
+    to.style = JSON.parse(JSON.stringify(from.style || {}));
+  } catch (e) {
+    /* bỏ qua */
+  }
+}
+
+const cleanFormula = (f) => String(f).trim().replace(/^=/, '');
+
+function applySpec(wb, spec) {
+  const ops = Array.isArray(spec && spec.ops) ? spec.ops : [];
+  let n = 0;
+  for (const op of ops) {
+    try {
+      const ws = getWs(wb, op.sheet, op.create);
+      if (!ws) continue;
+      if (op.type === 'fill' && op.col && op.formula) {
+        const from = Math.max(1, parseInt(op.from, 10) || 2);
+        const to = Math.min(from + 5000, parseInt(op.to, 10) || from);
+        const colNum = ws.getColumn(String(op.col).toUpperCase()).number;
+        if (op.header && from > 1) {
+          const hc = ws.getCell(from - 1, colNum);
+          hc.value = String(op.header);
+          if (colNum > 1) cloneStyle(ws.getCell(from - 1, colNum - 1), hc);
+        }
+        for (let r = from; r <= to; r++) {
+          const cell = ws.getCell(r, colNum);
+          cell.value = { formula: cleanFormula(op.formula).replace(/\{r\}/g, String(r)) };
+          if (colNum > 1) cloneStyle(ws.getCell(r, colNum - 1), cell);
+          if (op.numFmt) cell.numFmt = String(op.numFmt);
+        }
+        n++;
+      } else if (op.type === 'cell' && op.cell) {
+        const cell = ws.getCell(String(op.cell).toUpperCase());
+        if (op.formula) cell.value = { formula: cleanFormula(op.formula) };
+        else if (op.value !== undefined) cell.value = op.value;
+        else continue;
+        if (cell.col > 1) {
+          const left = ws.getCell(cell.row, cell.col - 1);
+          if (left.border && left.border.top && !(cell.border && cell.border.top)) cloneStyle(left, cell);
+        }
+        if (op.bold) cell.font = { ...(cell.font || {}), bold: true };
+        if (op.numFmt) cell.numFmt = String(op.numFmt);
+        n++;
+      }
+    } catch (e) {
+      console.warn('Bỏ qua 1 thao tác tính toán:', String((e && e.message) || e).slice(0, 100));
+    }
+  }
+  if (!n) throw new Error('Em chưa tạo được phép tính nào từ yêu cầu này, NHÂN nêu rõ hơn giúp em (tên cột, vị trí đặt kết quả)');
+  return n;
+}
+
+// ===== HÀM XUẤT RA CHO index.js =====
 async function processExcel(buf, opts = {}) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf);
-  wb.calcProperties = { fullCalcOnLoad: true };
-  const info = [];
-
-  wb.worksheets.forEach((ws, idx) => {
-    if (ws.rowCount < 1 || ws.columnCount < 1) return;
-    const spec = idx === 0 ? opts.spec : null;
-    const hr = Math.max(1, Math.min(10, Number(spec && spec.header_rows) || 1));
-
-    // dòng cuối có dữ liệu
-    let lastRow = ws.rowCount;
-    while (lastRow > hr && !ws.getRow(lastRow).hasValues) lastRow--;
-    let dataEnd = Math.min(lastRow, Number(spec && spec.data_end_row) || lastRow);
-    let lastCol = ws.columnCount;
-
-    if (opts.tinhToan) {
-      // 1) cột mới theo công thức
-      for (const nc of (spec && spec.new_columns) || []) {
-        if (!nc || !nc.formula || !SAFE_FORMULA.test(String(nc.formula))) continue;
-        lastCol++;
-        ws.getCell(hr, lastCol).value = String(nc.header || '');
-        for (let r = hr + 1; r <= dataEnd; r++) {
-          ws.getCell(r, lastCol).value = { formula: String(nc.formula).replace(/\{r\}/g, r).replace(/^=/, '') };
-        }
+  let info;
+  if (opts.tinhToan) {
+    const n = applySpec(wb, opts.spec || {});
+    wb.calcProperties = { ...(wb.calcProperties || {}), fullCalcOnLoad: true };
+    info = `Đã thực hiện ${n} thao tác tính toán${opts.spec && opts.spec.note ? ': ' + opts.spec.note : ''}. NHÂN mở bằng Excel để xem kết quả`;
+  } else {
+    let done = 0;
+    const lands = new Set();
+    wb.eachSheet((ws) => {
+      const r = formatSheet(ws, opts.orient);
+      if (r) {
+        done++;
+        lands.add(r.land ? 'ngang' : 'đứng');
       }
-      // 2) dòng tổng hợp
-      const summary = (spec && spec.summary) || []; // chỉ làm đúng yêu cầu của NHÂN, không tự thêm dòng tổng
-      let r = dataEnd + 1;
-      for (const s of summary || []) {
-        if (!s || !s.cells) continue;
-        // chèn ngay sau dữ liệu; nếu đã có dòng tổng cũ thì ghi đè vị trí đó
-        ws.getCell(r, colNumber(s.label_col || 'A')).value = String(s.label || '');
-        for (const [L, fnRaw] of Object.entries(s.cells)) {
-          const fn = String(fnRaw).toUpperCase();
-          if (!ALLOWED_FN.includes(fn)) continue;
-          const c = colNumber(L);
-          if (!c) continue;
-          const vals = [];
-          for (let k = hr + 1; k <= dataEnd; k++) { const v = numVal(ws.getCell(k, c)); if (v !== null) vals.push(v); }
-          let result;
-          if (vals.length) {
-            result = { SUM: vals.reduce((a, b) => a + b, 0), AVERAGE: vals.reduce((a, b) => a + b, 0) / vals.length, MAX: Math.max(...vals), MIN: Math.min(...vals), COUNT: vals.length }[fn];
-          }
-          const cell = ws.getCell(r, c);
-          cell.value = { formula: `${fn}(${L}${hr + 1}:${L}${dataEnd})`, ...(result !== undefined ? { result } : {}) };
-          cell.numFmt = fn === 'AVERAGE' ? '#,##0.00' : '#,##0';
-        }
-        r++;
-      }
-      lastRow = Math.max(lastRow, r - 1);
-    }
-
-    // ---- Kẻ viền, tiêu đề, độ rộng cột ----
-    let sumWidth = 0;
-    for (let c = 1; c <= lastCol; c++) {
-      let maxLen = 6;
-      for (let r = 1; r <= lastRow; r++) {
-        const cell = ws.getCell(r, c);
-        const isMergedTitle = r < hr || cell.isMerged;
-        if (r >= 1 && cell.value !== null && cell.value !== undefined && cell.value !== '') {
-          cell.border = BORDER;
-          cell.alignment = {
-            vertical: 'middle',
-            wrapText: true,
-            horizontal: r <= hr ? 'center' : (cell.alignment && cell.alignment.horizontal) || undefined,
-          };
-          if (r <= hr) cell.font = { ...(cell.font || {}), bold: true };
-          if (r === hr) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
-        }
-        if (!isMergedTitle) {
-          const t = typeof cell.value === 'object' && cell.value && cell.value.formula ? '00,000,000' : cellText(cell);
-          const longest = t.split('\n').reduce((a, b) => Math.max(a, b.length), 0);
-          maxLen = Math.max(maxLen, longest);
-        }
-      }
-      const w = Math.min(Math.max(maxLen + 2, 8), 45);
-      ws.getColumn(c).width = w;
-      sumWidth += w;
-    }
-
-    // ---- Thiết lập trang in: A4, vừa chiều rộng, không mất cột/mất trang ----
-    let orient = opts.orient || (spec && /ngang|landscape/i.test(spec.orientation || '') ? 'ngang' : spec && /doc|đứng/i.test(spec.orientation || '') ? 'doc' : null);
-    if (!orient) orient = lastCol >= 7 || sumWidth > 100 ? 'ngang' : 'doc';
-    ws.pageSetup = {
-      paperSize: 9,
-      orientation: orient === 'ngang' ? 'landscape' : 'portrait',
-      fitToPage: true,
-      fitToWidth: 1,
-      fitToHeight: 0,
-      horizontalCentered: true,
-      margins: { left: 0.4, right: 0.4, top: 0.6, bottom: 0.6, header: 0.3, footer: 0.3 },
-      printArea: `A1:${colLetter(lastCol)}${lastRow}`,
-      printTitlesRow: `1:${hr}`,
-    };
-    info.push(`${ws.name}: ${lastRow} dòng, ${lastCol} cột, A4 ${orient === 'ngang' ? 'ngang' : 'đứng'}`);
-  });
-
-  const out = Buffer.from(await wb.xlsx.writeBuffer());
-  return { buffer: out, info: info.join('; ') };
+    });
+    if (!done) throw new Error('File Excel không có dữ liệu để căn chỉnh');
+    info = `Đã kẻ bảng, căn chỉnh và đặt khổ A4 ${[...lands].join('/')}, vừa 1 trang theo chiều ngang (${done} trang tính). Lề trên, dưới, trái 2 cm, phải 1,5 cm`;
+  }
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  return { buffer, info };
 }
 
-module.exports = { parseOfficeCommand, fixWordImages, excelPreview, excelSpecFromAI, processExcel };
+async function excelPreview(buf) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const lines = [];
+  wb.eachSheet((ws) => {
+    const { lastRow, lastCol } = usedRange(ws);
+    lines.push(`### Trang tính "${ws.name}" (dòng cuối có dữ liệu: ${lastRow}, cột cuối: ${lastCol})`);
+    const show = (r) => {
+      const cells = [];
+      ws.getRow(r).eachCell({ includeEmpty: false }, (c) => {
+        const t = cellText(c);
+        if (t !== '') cells.push(`${c.address}=${t.slice(0, 60)}`);
+      });
+      if (cells.length) lines.push(`Dòng ${r}: ` + cells.join(' | '));
+    };
+    const head = Math.min(lastRow, 80);
+    for (let r = 1; r <= head; r++) show(r);
+    if (lastRow > head) {
+      lines.push('... (lược bớt các dòng giữa) ...');
+      for (let r = Math.max(head + 1, lastRow - 2); r <= lastRow; r++) show(r);
+    }
+  });
+  return lines.join('\n').slice(0, 30000);
+}
+
+const SPEC_PROMPT = `Bạn nhận nội dung một bảng Excel (liệt kê ô theo địa chỉ) và yêu cầu tính toán bằng tiếng Việt của NHÂN. Hãy chuyển yêu cầu thành các thao tác ghi công thức Excel vào ô. CHỈ trả về JSON hợp lệ, đúng cấu trúc:
+{"ops":[ ... ],"note":"một câu ngắn nêu đã làm gì"}
+Các loại thao tác:
+1) Điền công thức xuống một cột: {"type":"fill","sheet":"tên trang tính","col":"F","from":2,"to":15,"formula":"D{r}*E{r}","header":"Thành tiền","numFmt":"#,##0"}
+   ({r} là số dòng. "header" là tiêu đề cột mới, đặt ở dòng from-1; bỏ đi nếu cột đã có tiêu đề.)
+2) Ghi một ô: {"type":"cell","sheet":"tên trang tính","cell":"F16","formula":"SUM(F2:F15)","bold":true,"numFmt":"#,##0"}
+   hoặc ghi chữ: {"type":"cell","sheet":"tên trang tính","cell":"E16","value":"Cộng","bold":true}
+   Muốn lập bảng kết quả ở trang tính mới thì thêm "create":true và đặt tên trang tính mới cho các thao tác đó.
+Quy tắc:
+- Công thức viết bằng tên hàm tiếng Anh (SUM, SUMIF, COUNTIF, COUNTA, AVERAGE, IF, DATEDIF, DATE, YEAR, ROUND, ...), ngăn cách đối số bằng dấu phẩy.
+- Chỉ làm đúng và chỉ đúng điều NHÂN yêu cầu. Không sửa, không xóa dữ liệu gốc. Chỉ ghi vào ô trống hoặc cột mới. Không tự thêm cột, dòng tổng hay thống kê ngoài yêu cầu.
+- Dùng đúng địa chỉ ô, đúng dòng bắt đầu và dòng cuối dữ liệu theo bảng cung cấp. Không bịa số liệu.
+- Mốc tuổi Đảng được trao Huy hiệu: 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95 năm; các đợt trao tặng: 03/02, 30/04, 02/09, 07/11 hằng năm. Nếu yêu cầu liên quan, đối chiếu đúng các mốc này.
+- Nếu yêu cầu chưa rõ hoặc không xác định được cột/dòng cần tính thì chỉ trả về {"thieu":"một câu hỏi ngắn gửi NHÂN"}.`;
+
+async function excelSpecFromAI(callGemini, preview, args) {
+  const today = new Date().toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+  const prompt = `${SPEC_PROMPT}\n\nHôm nay là ${today}.\n\nNỘI DUNG BẢNG EXCEL:\n${preview}\n\nYÊU CẦU CỦA NHÂN:\n${args}`;
+  const res = await callGemini([{ role: 'user', parts: [{ text: prompt }] }], {
+    system: 'Bạn là chuyên viên xử lý bảng tính Excel. Chỉ trả về JSON.',
+    json: true,
+  });
+  const raw = (res.text || '').replace(/```json|```/g, '').trim();
+  let spec;
+  try {
+    spec = JSON.parse(raw);
+  } catch (e) {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error('AI trả về sai định dạng, NHÂN gửi lại yêu cầu giúp em');
+    spec = JSON.parse(m[0]);
+  }
+  if (spec.thieu) throw new Error(String(spec.thieu));
+  return spec;
+}
+
+module.exports = { fixWordImages, parseOfficeCommand, excelPreview, excelSpecFromAI, processExcel };
