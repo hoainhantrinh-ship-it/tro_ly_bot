@@ -560,23 +560,58 @@ bot.on('document', async (ctx) => {
   }
 });
 
-// ===== NHẬN ẢNH CHỤP =====
-bot.on('photo', async (ctx) => {
-  const req =
-    ctx.message.caption ||
-    'Đọc và chép lại đầy đủ nội dung trong ảnh. Nếu là văn bản hành chính, nêu thêm số hiệu, ngày ban hành, trích yếu.';
+// ===== NHẬN ẢNH CHỤP (1 ảnh hoặc nhiều ảnh gửi cùng lúc, đọc theo đúng thứ tự gửi) =====
+const REQ_ONE =
+  'Đọc và chép lại đầy đủ nội dung trong ảnh. Nếu là văn bản hành chính, nêu thêm số hiệu, ngày ban hành, trích yếu.';
+const REQ_MANY =
+  'Đọc và chép lại đầy đủ nội dung tất cả các trang theo đúng thứ tự từ trang 1 đến hết, không bỏ sót, gộp thành một nội dung liền mạch. Nếu là văn bản hành chính, nêu thêm số hiệu, ngày ban hành, trích yếu.';
+const albums = new Map(); // media_group_id -> {items, caption, ctx, timer}
+
+async function processPhotos(ctx, fileIds, req) {
+  const n = fileIds.length;
   try {
-    const photos = ctx.message.photo;
     const out = await withTyping(ctx, 'typing', async () => {
-      const buf = await downloadFile(ctx, photos[photos.length - 1].file_id);
-      const parts = [{ inlineData: { mimeType: 'image/jpeg', data: buf.toString('base64') } }, { text: req }];
-      return ask(ctx.chat.id, parts, `[Đã gửi 1 ảnh] ${req}`);
+      const parts = [];
+      for (let i = 0; i < n; i++) {
+        const buf = await downloadFile(ctx, fileIds[i]);
+        if (n > 1) parts.push({ text: `Ảnh/trang số ${i + 1}:` });
+        parts.push({ inlineData: { mimeType: 'image/jpeg', data: buf.toString('base64') } });
+      }
+      const order =
+        n > 1
+          ? `\n(Có ${n} ảnh, được gửi theo đúng thứ tự trang 1 đến trang ${n}. Xử lý theo đúng thứ tự này.)`
+          : '';
+      parts.push({ text: req + order });
+      return ask(ctx.chat.id, parts, `[Đã gửi ${n} ảnh] ${req}`);
     });
     await sendLong(ctx, out);
   } catch (e) {
     console.error('Lỗi xử lý ảnh:', e);
     await ctx.reply(friendlyError(e));
   }
+}
+
+bot.on('photo', async (ctx) => {
+  const m = ctx.message;
+  const fileId = m.photo[m.photo.length - 1].file_id;
+  const gid = m.media_group_id;
+  if (!gid) return processPhotos(ctx, [fileId], m.caption || REQ_ONE);
+
+  // Nhiều ảnh gửi cùng lúc: gom lại, chờ 2,5 giây không có ảnh mới thì xử lý một lần
+  let a = albums.get(gid);
+  if (!a) {
+    a = { items: [], caption: '', ctx, timer: null };
+    albums.set(gid, a);
+  }
+  a.items.push({ id: m.message_id, fileId });
+  a.ctx = ctx;
+  if (m.caption) a.caption = m.caption;
+  clearTimeout(a.timer);
+  a.timer = setTimeout(() => {
+    albums.delete(gid);
+    a.items.sort((x, y) => x.id - y.id); // đúng thứ tự gửi
+    processPhotos(a.ctx, a.items.map((i) => i.fileId), a.caption || REQ_MANY);
+  }, 2500);
 });
 
 // ===== NHẬN TIN NHẮN THOẠI =====
