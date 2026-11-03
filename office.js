@@ -1,6 +1,7 @@
 'use strict';
 const ExcelJS = require('exceljs');
 const JSZip = require('jszip');
+const { HyperFormula } = require('hyperformula');
 
 // ===== NHẬN DIỆN LỆNH =====
 const CMD_ALIAS = {
@@ -331,6 +332,57 @@ function applySpec(wb, spec) {
   return n;
 }
 
+// ===== EXCEL: TÍNH SẴN KẾT QUẢ CHO Ô CÔNG THỨC =====
+// ExcelJS chỉ ghi công thức, không tự tính. Hàm này tính bằng HyperFormula rồi ghi kèm kết quả,
+// để điện thoại/Telegram xem trước vẫn thấy số. Excel trên máy tính vẫn tự tính lại khi mở file.
+function fillCachedResults(wb) {
+  const sheets = {};
+  const fcells = [];
+  wb.eachSheet((ws) => {
+    const { lastRow, lastCol } = usedRange(ws);
+    const data = [];
+    for (let r = 1; r <= lastRow; r++) {
+      const row = [];
+      for (let c = 1; c <= lastCol; c++) {
+        const cell = ws.getCell(r, c);
+        if (cell.isMerged && cell.master !== cell) {
+          row.push(null); // bỏ ô phụ của vùng gộp
+          continue;
+        }
+        const v = cell.value;
+        if (v && typeof v === 'object' && v.formula) {
+          row.push('=' + cleanFormula(v.formula));
+          fcells.push([ws, r, c]);
+        } else if (v && typeof v === 'object' && Array.isArray(v.richText)) {
+          row.push(v.richText.map((x) => x.text || '').join(''));
+        } else if (v && typeof v === 'object' && !(v instanceof Date)) {
+          row.push(v.result !== undefined ? v.result : v.text !== undefined ? String(v.text) : null);
+        } else {
+          row.push(v === undefined ? null : v);
+        }
+      }
+      data.push(row);
+    }
+    sheets[ws.name] = data;
+  });
+  if (!fcells.length) return;
+  const hf = HyperFormula.buildFromSheets(sheets, { licenseKey: 'gpl-v3' });
+  try {
+    for (const [ws, r, c] of fcells) {
+      const val = hf.getCellValue({ sheet: hf.getSheetId(ws.name), row: r - 1, col: c - 1 });
+      const cell = ws.getCell(r, c);
+      const f = cell.value.formula;
+      if (val !== null && typeof val === 'object') {
+        cell.value = { formula: f }; // lỗi hoặc hàm không hỗ trợ: để Excel tự tính khi mở
+      } else {
+        cell.value = { formula: f, result: val === null ? '' : val };
+      }
+    }
+  } finally {
+    hf.destroy();
+  }
+}
+
 // ===== HÀM XUẤT RA CHO index.js =====
 async function processExcel(buf, opts = {}) {
   const wb = new ExcelJS.Workbook();
@@ -338,8 +390,12 @@ async function processExcel(buf, opts = {}) {
   let info;
   if (opts.tinhToan) {
     const n = applySpec(wb, opts.spec || {});
-    wb.calcProperties = { ...(wb.calcProperties || {}), fullCalcOnLoad: true };
-    info = `Đã thực hiện ${n} thao tác tính toán${opts.spec && opts.spec.note ? ': ' + opts.spec.note : ''}. NHÂN mở bằng Excel để xem kết quả`;
+    info = `Đã thực hiện ${n} thao tác tính toán${opts.spec && opts.spec.note ? ': ' + opts.spec.note : ''}`;
+    try {
+      fillCachedResults(wb); // chỉ tính sẵn kết quả ở bước tính toán
+    } catch (e) {
+      console.warn('Không tính sẵn được kết quả:', String((e && e.message) || e).slice(0, 120));
+    }
   } else {
     let done = 0;
     const lands = new Set();
@@ -353,6 +409,7 @@ async function processExcel(buf, opts = {}) {
     if (!done) throw new Error('File Excel không có dữ liệu để căn chỉnh');
     info = `Đã kẻ bảng, căn chỉnh và đặt khổ A4 ${[...lands].join('/')}, vừa 1 trang theo chiều ngang, ngắt trang tại ranh giới hàng (${done} trang tính). Lề trên, dưới, trái 2 cm, phải 1,5 cm`;
   }
+  wb.calcProperties = { ...(wb.calcProperties || {}), fullCalcOnLoad: true };
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
   return { buffer, info };
 }
@@ -382,6 +439,25 @@ async function excelPreview(buf) {
   return lines.join('\n').slice(0, 30000);
 }
 
+// Tóm tắt cấu trúc bảng (tên cột) để NHÂN nhìn thấy trên điện thoại, không cần biết địa chỉ ô
+async function excelOutline(buf) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const out = [];
+  wb.eachSheet((ws) => {
+    const { lastRow, lastCol } = usedRange(ws);
+    if (!lastRow || !lastCol) return;
+    const head = findHeaderRow(ws, lastCol);
+    const cols = [];
+    for (let c = 1; c <= lastCol; c++) {
+      const t = [...new Set([head, head + 1].map((r) => cellText(ws.getCell(r, c)).trim()).filter(Boolean))].join(' ');
+      if (t) cols.push(`${ws.getColumn(c).letter}: ${t.slice(0, 40)}`);
+    }
+    out.push(`Trang "${ws.name}" (tiêu đề ở dòng ${head}, dữ liệu đến dòng ${lastRow})\nCác cột: ${cols.join(' | ')}`);
+  });
+  return out.join('\n\n') || '(File chưa có dữ liệu)';
+}
+
 const SPEC_PROMPT = `Bạn nhận nội dung một bảng Excel (liệt kê ô theo địa chỉ) và yêu cầu tính toán bằng tiếng Việt của NHÂN. Hãy chuyển yêu cầu thành các thao tác ghi công thức Excel vào ô. CHỈ trả về JSON hợp lệ, đúng cấu trúc:
 {"ops":[ ... ],"note":"một câu ngắn nêu đã làm gì"}
 Các loại thao tác:
@@ -389,13 +465,19 @@ Các loại thao tác:
    ({r} là số dòng. "header" là tiêu đề cột mới, đặt ở dòng from-1; bỏ đi nếu cột đã có tiêu đề.)
 2) Ghi một ô: {"type":"cell","sheet":"tên trang tính","cell":"F16","formula":"SUM(F2:F15)","bold":true,"numFmt":"#,##0"}
    hoặc ghi chữ: {"type":"cell","sheet":"tên trang tính","cell":"E16","value":"Cộng","bold":true}
+   hoặc ghi số: {"type":"cell","sheet":"tên trang tính","cell":"E13","value":50000,"numFmt":"#,##0"}
    Muốn lập bảng kết quả ở trang tính mới thì thêm "create":true và đặt tên trang tính mới cho các thao tác đó.
 Quy tắc:
 - Công thức viết bằng tên hàm tiếng Anh (SUM, SUMIF, COUNTIF, COUNTA, AVERAGE, IF, DATEDIF, DATE, YEAR, ROUND, ...), ngăn cách đối số bằng dấu phẩy.
 - Chỉ làm đúng và chỉ đúng điều NHÂN yêu cầu. Không sửa, không xóa dữ liệu gốc. Chỉ ghi vào ô trống hoặc cột mới. Không tự thêm cột, dòng tổng hay thống kê ngoài yêu cầu.
 - Dùng đúng địa chỉ ô, đúng dòng bắt đầu và dòng cuối dữ liệu theo bảng cung cấp. Không bịa số liệu.
 - Mốc tuổi Đảng được trao Huy hiệu: 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95 năm; các đợt trao tặng: 03/02, 30/04, 02/09, 07/11 hằng năm. Nếu yêu cầu liên quan, đối chiếu đúng các mốc này.
-- Nếu yêu cầu chưa rõ hoặc không xác định được cột/dòng cần tính thì chỉ trả về {"thieu":"một câu hỏi ngắn gửi NHÂN"}.`;
+- NHÂN xem file trên điện thoại, không thấy địa chỉ ô: tuyệt đối không hỏi NHÂN địa chỉ ô, cột hay dòng. Tự xác định vị trí từ tiêu đề cột và nhãn chữ trong bảng.
+- Dòng cuối của vùng tính ("to") là dòng dữ liệu cuối của bảng, không tính các dòng ghi chú, chữ ký hay nhãn phía dưới bảng.
+- Cột kết quả đã có tiêu đề thì ghi vào cột đó và bỏ "header"; chưa có thì thêm cột mới ngay bên phải bảng kèm "header".
+- Số tiền, đơn giá, hệ số: chỉ dùng đúng số NHÂN nêu, không tự suy ra. Ghi số đó vào MỘT Ô RIÊNG (ưu tiên ô trống ngay bên phải nhãn như "Đơn giá...") rồi để công thức tham chiếu địa chỉ tuyệt đối, ví dụ K{r}*$E$13. Không viết cứng số vào công thức.
+- Đếm theo ký hiệu (ví dụ "x"): dùng COUNTIF trên đúng vùng ô chấm công của dòng đó, ví dụ COUNTIF(C{r}:J{r},"x").
+- Chỉ trả về {"thieu":"..."} khi thật sự không thể suy ra. Câu hỏi phải dùng tên cột, tên nhãn (không dùng địa chỉ ô) và nêu sẵn phương án gợi ý để NHÂN chỉ cần trả lời "đồng ý".`;
 
 async function excelSpecFromAI(callGemini, preview, args) {
   const today = new Date().toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
@@ -413,8 +495,12 @@ async function excelSpecFromAI(callGemini, preview, args) {
     if (!m) throw new Error('AI trả về sai định dạng, NHÂN gửi lại yêu cầu giúp em');
     spec = JSON.parse(m[0]);
   }
-  if (spec.thieu) throw new Error(String(spec.thieu));
+  if (spec.thieu) {
+    const err = new Error(String(spec.thieu));
+    err.needInfo = true; // index.js dùng cờ này để giữ yêu cầu cũ và chờ NHÂN trả lời bổ sung
+    throw err;
+  }
   return spec;
 }
 
-module.exports = { fixWordImages, parseOfficeCommand, excelPreview, excelSpecFromAI, processExcel };
+module.exports = { fixWordImages, parseOfficeCommand, excelPreview, excelOutline, excelSpecFromAI, processExcel };
