@@ -520,7 +520,7 @@ async function makeFormalDoc(ctx, request) {
 
 // ===== WORD CÓ HÌNH ẢNH / EXCEL ĐỊNH DẠNG - TÍNH TOÁN =====
 const pendingOffice = new Map(); // chatId -> {cmd, args, at}: NHÂN gõ lệnh trước, gửi file sau
-const pendingExcelFlow = new Map(); // chatId -> {stage, buffer, filename, at, timer}
+const pendingExcelFlow = new Map(); // chatId -> {stage, buffer, filename, at, timer, lastRequest}
 const EXCEL_FLOW_TTL = 15 * 60 * 1000;
 
 function saveExcelFlow(chatId, data) {
@@ -545,10 +545,12 @@ function readExcelFlow(chatId) {
 }
 
 async function runExcelCalculation(ctx, state, request) {
+  // Gộp yêu cầu cũ (nếu bot đã hỏi lại) với câu trả lời bổ sung của NHÂN
+  const full = state.lastRequest ? state.lastRequest + '\n' + request : request;
   try {
     const result = await withTyping(ctx, 'upload_document', async () => {
       const preview = await office.excelPreview(state.buffer);
-      const spec = await office.excelSpecFromAI(callGemini, preview, request);
+      const spec = await office.excelSpecFromAI(callGemini, preview, full);
       return office.processExcel(state.buffer, { tinhToan: true, spec });
     });
     saveExcelFlow(ctx.chat.id, {
@@ -558,11 +560,16 @@ async function runExcelCalculation(ctx, state, request) {
       calculated: true,
     });
     await ctx.reply(
-      `Em đã lập phép tính theo yêu cầu (${result.info}). NHÂN muốn đặt giấy đứng hay ngang? Gửi /excel đứng hoặc /excel ngang để hoàn tất. Excel sẽ tính kết quả khi NHÂN mở file.`
+      `Em đã lập phép tính theo yêu cầu (${result.info}). NHÂN muốn đặt giấy đứng hay ngang? Gửi /excel đứng hoặc /excel ngang để hoàn tất.`
     );
   } catch (e) {
+    if (e && e.needInfo) {
+      // AI cần thêm thông tin: giữ yêu cầu cũ, chờ NHÂN trả lời bổ sung
+      saveExcelFlow(ctx.chat.id, { ...state, stage: 'calculation_request', lastRequest: full });
+      return ctx.reply('Em cần thêm thông tin: ' + e.message);
+    }
     console.error('Lỗi tính toán Excel theo hội thoại:', e);
-    await ctx.reply(isTransient(errText(e)) ? friendlyError(e) : 'Em chưa thực hiện được phép tính: ' + errText(e).slice(0, 180));
+    await ctx.reply(isTransient(errText(e)) ? friendlyError(e) : 'Em chưa thực hiện được phép tính: ' + errText(e).slice(0, 300));
   }
 }
 
@@ -604,20 +611,21 @@ async function handleExcelFlowText(ctx, text) {
     return true;
   }
 
-  const yes = /^(có|co|có nhé|đồng ý|muốn|có,?.*)$/i.test(t);
-  const no = /^(không|khong|không cần|không tính(?: toán)?|không,?.*)$/i.test(t);
+  // Chỉ coi là "có/không" khi câu bắt đầu đúng từ đó. "Không" chỉ là từ chối khi đứng riêng một mình.
+  const yes = /^(có|co|đồng ý|muốn)(?=[\s,.:;!]|$)/i.test(t);
+  const no = /^(không|khong|không cần|không tính(?: toán)?)\s*[.!]?$/i.test(t);
   if (no) {
     saveExcelFlow(ctx.chat.id, { ...state, stage: 'orientation' });
     await ctx.reply('Dạ. NHÂN chọn hướng giấy bằng /excel đứng hoặc /excel ngang để em căn chỉnh và gửi file nhé.');
     return true;
   }
   if (yes) {
-    const request = t.replace(/^(có|co|có nhé|đồng ý|muốn)\s*[, :]*/i, '').trim();
+    const request = t.replace(/^(có|co|đồng ý|muốn)\s*[,.:;! ]*/i, '').trim();
     if (request) {
       await runExcelCalculation(ctx, state, request);
     } else {
       saveExcelFlow(ctx.chat.id, { ...state, stage: 'calculation_request' });
-      await ctx.reply('NHÂN ghi phép tính cần làm bằng tiếng Việt nhé, ví dụ: tính thành tiền bằng số lượng nhân đơn giá, rồi tính tổng cột thành tiền.');
+      await ctx.reply('NHÂN ghi phép tính cần làm bằng tiếng Việt, theo tên cột (không cần địa chỉ ô), ví dụ: cột Thành tiền bằng cột Số buổi nhân đơn giá 50.000 đồng.');
     }
     return true;
   }
@@ -759,7 +767,16 @@ bot.on('document', async (ctx) => {
         buffer,
         filename: doc.file_name || 'bang_tinh.xlsx',
       });
-      return ctx.reply('NHÂN có muốn tính toán trong bảng Excel này không? Trả lời “có” rồi ghi phép tính bằng tiếng Việt, hoặc “không”. Sau đó bot sẽ hỏi hướng giấy để NHÂN chọn /excel đứng hoặc /excel ngang.');
+      let outline = '';
+      try {
+        outline = await office.excelOutline(buffer);
+      } catch (e) {
+        console.warn('Không lập được danh sách cột:', errText(e).slice(0, 120));
+      }
+      return ctx.reply(
+        (outline ? 'Em đã đọc file:\n' + outline + '\n\n' : '') +
+          'NHÂN có muốn tính toán trong bảng này không? Trả lời "có" rồi mô tả phép tính theo tên cột (không cần địa chỉ ô), hoặc "không". Sau đó chọn /excel đứng hoặc /excel ngang để căn chỉnh khổ giấy.'
+      );
     } catch (e) {
       console.error('Lỗi nhận file Excel:', e);
       return ctx.reply(friendlyError(e));
